@@ -1,0 +1,35 @@
+{
+  "node_features": [
+    "flow_count",
+    "malicious_flow_ratio",
+    "inbound_flow_count",
+    "outbound_flow_count",
+    "unique_peer_count",
+    "protocol_tcp_ratio",
+    "protocol_udp_ratio",
+    "protocol_other_ratio",
+    "total_packets_sum",
+    "total_bytes_sum",
+    "avg_flow_duration",
+    "avg_flow_bytes_per_s",
+    "avg_flow_packets_per_s",
+    "avg_packet_size"
+  ],
+  "edge_features": [
+    "flow_count",
+    "malicious_ratio",
+    "total_packets_sum",
+    "total_bytes_sum",
+    "avg_flow_duration",
+    "avg_flow_bytes_per_s",
+    "avg_flow_packets_per_s",
+    "protocol_tcp_ratio",
+    "protocol_udp_ratio",
+    "protocol_other_ratio"
+  ],
+  "label_mapping": {
+    "benign": 0,
+    "malicious": 1
+  },
+  "node_id_mapping_file": "node_mapping.json"
+}
