@@ -2,14 +2,19 @@ import argparse
 import os
 import os.path as osp
 import time
+from pathlib import Path
 
 import cupy
+import numpy as np
 import psutil
 import rmm
 import torch
 import torch.distributed as dist
+import torch_geometric
 from rmm.allocators.cupy import rmm_cupy_allocator
 from rmm.allocators.torch import rmm_torch_allocator
+from torch_geometric.data import Data
+from torch_geometric.loader import NeighborLoader as PyGNeighborLoader
 
 # Must change allocators immediately upon import
 # or else other imports will cause memory to be
@@ -19,18 +24,120 @@ from rmm.allocators.torch import rmm_torch_allocator
 # See help(rmm.reinitialize) for full details.
 rmm.reinitialize(devices=[0], pool_allocator=True, managed_memory=True)
 cupy.cuda.set_allocator(rmm_cupy_allocator)
-torch.cuda.memory.change_current_allocator(rmm_torch_allocator)
+#torch.cuda.memory.change_current_allocator(rmm_torch_allocator)
 
 import cudf  # noqa
 import cugraph_pyg  # noqa
 import torch.nn.functional as F  # noqa
 # Enable cudf spilling to save gpu memory
-from cugraph_pyg.loader import NeighborLoader  # noqa
-from ogb.nodeproppred import PygNodePropPredDataset  # noqa
+#from cugraph_pyg.loader import NeighborLoader  # noqa
+#from ogb.nodeproppred import PygNodePropPredDataset  # noqa
 
 import torch_geometric  # noqa
 
 cudf.set_option("spill", True)
+
+
+class IDSWindowedDataset:
+    """Dataset class for loading windowed graph data from data_graph.py pipeline.
+    
+    Loads .npz files containing:
+    - node_features: Node feature matrix
+    - node_labels: Node labels (0=benign, 1=malicious)
+    - edge_index: Edge index in COO format (2 x num_edges)
+    - edge_features: Edge feature matrix
+    """
+    
+    def __init__(self, root_dir: str, split: str = "train"):
+        """
+        Args:
+            root_dir: Root directory containing graphs/{split}/ subdirectories
+            split: Split name ('train', 'val', or 'test')
+        """
+        self.root_dir = Path(root_dir)
+        self.split = split
+        self.graphs_dir = self.root_dir / "graphs" / split
+        
+        if not self.graphs_dir.exists():
+            raise ValueError(f"Graph directory not found: {self.graphs_dir}")
+        
+        # Load all .npz files in the split directory
+        self.graph_files = sorted(self.graphs_dir.glob("*.npz"))
+        if not self.graph_files:
+            raise ValueError(f"No .npz files found in {self.graphs_dir}")
+        
+        # Load the first graph as the main data object
+        # For windowed data, we typically train on one window at a time
+        # or concatenate all windows into a single graph
+        self._load_graphs()
+    
+    def _load_graphs(self):
+        """Load all graphs from .npz files and combine into a single Data object."""
+        all_node_features = []
+        all_node_labels = []
+        all_edge_indices = []
+        all_edge_features = []
+        node_offset = 0
+        
+        for graph_file in self.graph_files:
+            data = np.load(graph_file)
+            
+            num_nodes = data['node_features'].shape[0]
+            
+            all_node_features.append(data['node_features'])
+            all_node_labels.append(data['node_labels'])
+            
+            # Adjust edge indices for node offset
+            edge_index = data['edge_index'].astype(np.int64).copy()
+            edge_index[:] += node_offset
+            all_edge_indices.append(edge_index)
+            
+            all_edge_features.append(data['edge_features'])
+            node_offset += num_nodes
+        
+        # Concatenate all arrays
+        self.node_features = np.vstack(all_node_features)
+        self.node_labels = np.concatenate(all_node_labels)
+        self.edge_index = np.hstack(all_edge_indices)
+        self.edge_features = np.vstack(all_edge_features) if all_edge_features[0].shape[0] > 0 else np.zeros((0, 10))
+        
+        # Convert to torch tensors
+        self.x = torch.tensor(self.node_features, dtype=torch.float32)
+        self.y = torch.tensor(self.node_labels, dtype=torch.long)
+        self.edge_index = torch.tensor(self.edge_index, dtype=torch.long)
+        self.edge_attr = torch.tensor(self.edge_features, dtype=torch.float32) if self.edge_features.shape[0] > 0 else torch.zeros((0, 10), dtype=torch.float32)
+        
+        self.num_nodes = self.x.shape[0]
+        self.num_features = self.x.shape[1]
+        self.num_classes = 2  # Binary classification: benign vs malicious
+        
+        # Create split indices (all nodes in this split are used)
+        self.split_idx = {
+            'train': torch.arange(self.num_nodes) if self.split == 'train' else torch.tensor([], dtype=torch.long),
+            'valid': torch.arange(self.num_nodes) if self.split == 'val' else torch.tensor([], dtype=torch.long),
+            'test': torch.arange(self.num_nodes) if self.split == 'test' else torch.tensor([], dtype=torch.long),
+        }
+    
+    def __getitem__(self, idx):
+        """Return a PyG Data object."""
+        data = Data()
+        data.x = self.x
+        data.y = self.y
+        data.edge_index = self.edge_index
+        data.edge_attr = self.edge_attr
+        data.num_nodes = self.num_nodes
+        return data
+    
+    def __len__(self):
+        return 1
+    
+    def get_idx_split(self):
+        """Return split indices."""
+        return self.split_idx
+    
+    @property
+    def num_graphs(self):
+        return len(self.graph_files)
 
 
 # ---------------- Distributed helpers ----------------
@@ -92,9 +199,9 @@ def arg_parse():
     parser.add_argument(
         '--dataset',
         type=str,
-        default='ogbn-arxiv',
-        choices=['ogbn-papers100M', 'ogbn-products', 'ogbn-arxiv'],
-        help='Dataset name.',
+        default='ids-custom',
+        choices=['ogbn-papers100M', 'ogbn-products', 'ogbn-arxiv', 'ids-custom'],
+        help='Dataset name. Use "ids-custom" for custom IDS data from data_graph.py.',
     )
     parser.add_argument(
         '--dataset_dir',
@@ -105,8 +212,8 @@ def arg_parse():
     parser.add_argument(
         "--dataset_subdir",
         type=str,
-        default="ogbn-arxiv",
-        help="directory of dataset.",
+        default="",
+        help="Subdirectory of dataset (for OGB datasets). Ignored for ids-custom.",
     )
     parser.add_argument('-e', '--epochs', type=int, default=50)
     parser.add_argument('--num_layers', type=int, default=3)
@@ -174,41 +281,70 @@ def create_loader(
     )
 
 
-def train(model, train_loader, optimizer):
+def train(model, train_loader, optimizer, is_custom_dataset=False):
     model.train()
 
     total_loss = total_correct = total_examples = 0
     for batch in train_loader:
-        batch = batch.cuda()
-        optimizer.zero_grad()
-        out = model(batch.x, batch.edge_index)[:batch.batch_size]
-        y = batch.y[:batch.batch_size].view(-1).to(torch.long)
-        loss = F.cross_entropy(out, y)
-        loss.backward()
-        optimizer.step()
+        if is_custom_dataset:
+            # Custom IDS dataset format
+            batch_x = batch.x.cuda()
+            batch_y = batch.y.cuda()
+            batch_edge_index = batch.edge_index.cuda()
+            
+            optimizer.zero_grad()
+            out = model(batch_x, batch_edge_index)
+            loss = F.cross_entropy(out, batch_y.view(-1))
+            loss.backward()
+            optimizer.step()
 
-        total_loss += loss * y.size(0)
-        total_correct += out.argmax(dim=-1).eq(y).sum()
-        total_examples += y.size(0)
+            total_loss += loss.item() * batch_y.size(0)
+            total_correct += out.argmax(dim=-1).eq(batch_y.view(-1)).sum().item()
+            total_examples += batch_y.size(0)
+        else:
+            # OGB/cugraph_pyg format
+            batch = batch.cuda()
+            optimizer.zero_grad()
+            out = model(batch.x, batch.edge_index)[:batch.batch_size]
+            y = batch.y[:batch.batch_size].view(-1).to(torch.long)
+            loss = F.cross_entropy(out, y)
+            loss.backward()
+            optimizer.step()
 
-    return total_loss.item() / total_examples, total_correct.item(
-    ) / total_examples
+            total_loss += loss * y.size(0)
+            total_correct += out.argmax(dim=-1).eq(y).sum()
+            total_examples += y.size(0)
+
+    #return total_loss.item() / total_examples, total_correct.item(
+    return total_loss / total_examples, total_correct / total_examples
 
 
 @torch.no_grad()
-def test(model, loader):
+def test(model, loader, is_custom_dataset=False):
     model.eval()
 
     total_correct = total_examples = 0
     for batch in loader:
-        batch = batch.cuda()
-        out = model(batch.x, batch.edge_index)[:batch.batch_size]
-        y = batch.y[:batch.batch_size].view(-1).to(torch.long)
+        if is_custom_dataset:
+            # Custom IDS dataset format
+            batch_x = batch.x.cuda()
+            batch_y = batch.y.cuda()
+            batch_edge_index = batch.edge_index.cuda()
+            
+            out = model(batch_x, batch_edge_index)
+            total_correct += out.argmax(dim=-1).eq(batch_y.view(-1)).sum().item()
+            total_examples += batch_y.size(0)
+        else:
+            # OGB/cugraph_pyg format
+            batch = batch.cuda()
+            out = model(batch.x, batch.edge_index)[:batch.batch_size]
+            y = batch.y[:batch.batch_size].view(-1).to(torch.long)
 
-        total_correct += out.argmax(dim=-1).eq(y).sum()
-        total_examples += y.size(0)
+            total_correct += out.argmax(dim=-1).eq(y).sum()
+            total_examples += y.size(0)
 
-    return total_correct.item() / total_examples
+    #return total_correct.item() / total_examples
+    return total_correct / total_examples
 
 
 if __name__ == '__main__':
@@ -227,66 +363,113 @@ if __name__ == '__main__':
 
     wall_clock_start = time.perf_counter()
 
-    root = osp.join(args.dataset_dir, args.dataset_subdir)
+    if args.dataset == 'ids-custom':
+        # Load custom IDS dataset from data_graph.py pipeline
+        if safe_get_rank() == 0:
+            print(f'Loading custom IDS dataset from: {args.dataset_dir}')
+        
+        # Load train, val, test splits
+        train_dataset = IDSWindowedDataset(args.dataset_dir, split='train')
+        val_dataset = IDSWindowedDataset(args.dataset_dir, split='val')
+        test_dataset = IDSWindowedDataset(args.dataset_dir, split='test')
+        
+        # Get data objects
+        train_data = train_dataset[0]
+        val_data = val_dataset[0]
+        test_data = test_dataset[0]
+        
+        # Use train data as the main data object
+        data = train_data
+        
+        if safe_get_rank() == 0:
+            print('Loaded IDS dataset:')
+            print(f'  Train: {train_data.num_nodes} nodes, {train_data.edge_index.shape[1]} edges')
+            print(f'  Val: {val_data.num_nodes} nodes, {val_data.edge_index.shape[1]} edges')
+            print(f'  Test: {test_data.num_nodes} nodes, {test_data.edge_index.shape[1]} edges')
+            print(f'  Node features: {train_data.x.shape[1]}, Classes: {train_dataset.num_classes}')
+        
+        # Create split indices for training
+        split_idx = {
+            'train': torch.arange(train_data.num_nodes),
+            'valid': torch.arange(val_data.num_nodes),
+            'test': torch.arange(test_data.num_nodes),
+        }
+        
+        # Store datasets for later use
+        datasets = {'train': train_dataset, 'val': val_dataset, 'test': test_dataset}
+        
+    else:
+        # Original OGB dataset loading
+        root = osp.join(args.dataset_dir, args.dataset_subdir)
 
-    if safe_get_rank() == 0:
-        print('The root is: ', root)
+        if safe_get_rank() == 0:
+            print('The root is: ', root)
 
-    torch.serialization.add_safe_globals([torch_geometric.data.data.DataEdgeAttr])
-    torch.serialization.add_safe_globals([torch_geometric.data.data.DataTensorAttr])
-    torch.serialization.add_safe_globals([torch_geometric.data.storage.GlobalStorage])
+        torch.serialization.add_safe_globals([torch_geometric.data.data.DataEdgeAttr])
+        torch.serialization.add_safe_globals([torch_geometric.data.data.DataTensorAttr])
+        torch.serialization.add_safe_globals([torch_geometric.data.storage.GlobalStorage])
 
-    dataset = PygNodePropPredDataset(name=args.dataset, root=root)
-    split_idx = dataset.get_idx_split()
+        dataset = PygNodePropPredDataset(name=args.dataset, root=root)
+        split_idx = dataset.get_idx_split()
 
-    data = dataset[0]
-    if not args.use_directed_graph:
-        data.edge_index = torch_geometric.utils.to_undirected(
-            data.edge_index, reduce="mean")
-    if args.add_self_loop:
-        data.edge_index, _ = torch_geometric.utils.remove_self_loops(
-            data.edge_index)
-        data.edge_index, _ = torch_geometric.utils.add_self_loops(
-            data.edge_index, num_nodes=data.num_nodes)
+        data = dataset[0]
+        if not args.use_directed_graph:
+            data.edge_index = torch_geometric.utils.to_undirected(
+                data.edge_index, reduce="mean")
+        if args.add_self_loop:
+            data.edge_index, _ = torch_geometric.utils.remove_self_loops(
+                data.edge_index)
+            data.edge_index, _ = torch_geometric.utils.add_self_loops(
+                data.edge_index, num_nodes=data.num_nodes)
+        
+        # Setup cugraph_pyg stores for OGB datasets
+        graph_store = cugraph_pyg.data.GraphStore()
+        graph_store[dict(
+            edge_type=('node', 'rel', 'node'),
+            layout='coo',
+            is_sorted=False,
+            size=(data.num_nodes, data.num_nodes),
+        )] = data.edge_index
 
-    graph_store = cugraph_pyg.data.GraphStore()
-    graph_store[dict(
-        edge_type=('node', 'rel', 'node'),
-        layout='coo',
-        is_sorted=False,
-        size=(data.num_nodes, data.num_nodes),
-    )] = data.edge_index
+        feature_store = cugraph_pyg.data.FeatureStore()
+        feature_store['node', 'x', None] = data.x
+        feature_store['node', 'y', None] = data.y
 
-    feature_store = cugraph_pyg.data.FeatureStore()
-    feature_store['node', 'x', None] = data.x
-    feature_store['node', 'y', None] = data.y
-
-    data = (feature_store, graph_store)
+        data = (feature_store, graph_store)
+        datasets = None
 
     if safe_get_rank() == 0:
         print(f"Training {args.dataset} with {args.model} model.")
 
+    # Get dataset info based on dataset type
+    if args.dataset == 'ids-custom':
+        num_features = data.x.shape[1]
+        num_classes = 2  # Binary classification
+    else:
+        num_features = dataset.num_features
+        num_classes = dataset.num_classes
+
     if args.model == "GAT":
-        model = torch_geometric.nn.models.GAT(dataset.num_features,
+        model = torch_geometric.nn.models.GAT(num_features,
                                               args.hidden_channels,
                                               args.num_layers,
-                                              dataset.num_classes,
+                                              num_classes,
                                               heads=args.num_heads).cuda()
     elif args.model == "GCN":
-        model = torch_geometric.nn.models.GCN(dataset.num_features,
+        model = torch_geometric.nn.models.GCN(num_features,
                                               args.hidden_channels,
                                               args.num_layers,
-                                              dataset.num_classes).cuda()
+                                              num_classes).cuda()
     elif args.model == "SAGE":
         model = torch_geometric.nn.models.GraphSAGE(
-            dataset.num_features, args.hidden_channels, args.num_layers,
-            dataset.num_classes).cuda()
+            num_features, args.hidden_channels, args.num_layers,
+            num_classes).cuda()
     elif args.model == 'SGFormer':
         # TODO add support for this with disjoint sampling
         model = torch_geometric.nn.models.SGFormer(
-            in_channels=dataset.num_features,
+            in_channels=num_features,
             hidden_channels=args.hidden_channels,
-            out_channels=dataset.num_classes,
+            out_channels=num_classes,
             trans_num_heads=args.num_heads,
             trans_dropout=args.dropout,
             gnn_num_layers=args.num_layers,
@@ -298,20 +481,71 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                  weight_decay=args.wd)
 
-    loader_kwargs = dict(
-        data=data,
-        num_neighbors=[args.fan_out] * args.num_layers,
-        replace=False,
-        batch_size=args.batch_size,
-    )
+    if args.dataset == 'ids-custom':
+        # For custom IDS dataset, use PyG's NeighborLoader for neighbor sampling
+        # This properly handles sampling neighbors for each node in the batch
+        
+        num_neighbors = [args.fan_out] * args.num_layers
+        
+        # Create NeighborLoaders for each split
+        # The loader will sample neighbors for nodes in each batch
+        train_loader = PyGNeighborLoader(
+            data=data,
+            num_neighbors=num_neighbors,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+        )
+        
+        val_loader = PyGNeighborLoader(
+            data=data,
+            num_neighbors=num_neighbors,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+        
+        test_loader = PyGNeighborLoader(
+            data=data,
+            num_neighbors=num_neighbors,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+        
+    else:
+        # Original OGB dataset loading with cugraph_pyg
+        graph_store = cugraph_pyg.data.GraphStore()
+        graph_store[dict(
+            edge_type=('node', 'rel', 'node'),
+            layout='coo',
+            is_sorted=False,
+            size=(data.num_nodes, data.num_nodes),
+        )] = data.edge_index
 
-    train_loader = create_loader(split_idx['train'], 'train', **loader_kwargs,
-                                 shuffle=True)
-    val_loader = create_loader(split_idx['valid'], 'val', **loader_kwargs)
-    test_loader = create_loader(split_idx['test'], 'test', **loader_kwargs)
+        feature_store = cugraph_pyg.data.FeatureStore()
+        feature_store['node', 'x', None] = data.x
+        feature_store['node', 'y', None] = data.y
+
+        data = (feature_store, graph_store)
+
+        loader_kwargs = dict(
+            data=data,
+            num_neighbors=[args.fan_out] * args.num_layers,
+            replace=False,
+            batch_size=args.batch_size,
+        )
+
+        train_loader = create_loader(split_idx['train'], 'train', **loader_kwargs,
+                                     shuffle=True)
+        val_loader = create_loader(split_idx['valid'], 'val', **loader_kwargs)
+        test_loader = create_loader(split_idx['test'], 'test', **loader_kwargs)
 
     if dist.is_initialized():
         dist.barrier()  # sync before training
+
+    # Determine if using custom dataset
+    is_custom_dataset = (args.dataset == 'ids-custom')
 
     if safe_get_rank() == 0:
         prep_time = round(time.perf_counter() - wall_clock_start, 2)
@@ -324,12 +558,12 @@ if __name__ == '__main__':
     start = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
         train_start = time.perf_counter()
-        loss, train_acc = train(model, train_loader, optimizer)
+        loss, train_acc = train(model, train_loader, optimizer, is_custom_dataset=is_custom_dataset)
         train_end = time.perf_counter()
         train_times.append(train_end - train_start)
         inference_start = time.perf_counter()
-        train_acc = test(model, train_loader)
-        val_acc = test(model, val_loader)
+        train_acc = test(model, train_loader, is_custom_dataset=is_custom_dataset)
+        val_acc = test(model, val_loader, is_custom_dataset=is_custom_dataset)
         inference_times.append(time.perf_counter() - inference_start)
         val_accs.append(val_acc)
 
@@ -348,7 +582,7 @@ if __name__ == '__main__':
             torch.tensor(val_accs).std()))
         print(f"Best validation accuracy: {best_val:.4f}")
         print("Testing...")
-        final_test_acc = test(model, test_loader)
+        final_test_acc = test(model, test_loader, is_custom_dataset=is_custom_dataset)
         print(f'Test Accuracy: {final_test_acc:.4f}')
         total_time = round(time.perf_counter() - wall_clock_start, 2)
         print("Total Program Runtime (total_time) =", total_time, "seconds")
