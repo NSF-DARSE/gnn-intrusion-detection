@@ -29,9 +29,16 @@ cupy.cuda.set_allocator(rmm_cupy_allocator)
 import cudf  # noqa
 import cugraph_pyg  # noqa
 import torch.nn.functional as F  # noqa
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
 # Enable cudf spilling to save gpu memory
 #from cugraph_pyg.loader import NeighborLoader  # noqa
-#from ogb.nodeproppred import PygNodePropPredDataset  # noqa
+# Import OGB node property prediction dataset for standard benchmarks
+from ogb.nodeproppred import PygNodePropPredDataset  # noqa
+
+# Visualization utilities (optional, requires matplotlib & scikit-learn)
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
 
 import torch_geometric  # noqa
 
@@ -271,7 +278,7 @@ def create_loader(
     if safe_get_rank() == 0:
         print(f'Creating {stage_name} loader...')
 
-    return NeighborLoader(
+    return PyGNeighborLoader(
         data,
         num_neighbors=num_neighbors,
         input_nodes=input_nodes,
@@ -346,6 +353,67 @@ def test(model, loader, is_custom_dataset=False):
     #return total_correct.item() / total_examples
     return total_correct / total_examples
 
+# ---------------------------------------------------------------------
+# Visualization helpers (confusion matrix)
+# ---------------------------------------------------------------------
+def _gather_predictions(model, loader, is_custom_dataset=False):
+    """Run ``model`` on ``loader`` and collect predictions and true labels.
+
+    Returns two NumPy arrays: ``preds`` and ``labels``. Used after training to
+    compute a confusion matrix.
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    for batch in loader:
+        if is_custom_dataset:
+            x = batch.x.cuda()
+            y = batch.y.cuda()
+            edge_index = batch.edge_index.cuda()
+            out = model(x, edge_index)
+            preds = out.argmax(dim=-1).cpu().numpy()
+            labels = y.view(-1).cpu().numpy()
+        else:
+            batch = batch.cuda()
+            out = model(batch.x, batch.edge_index)[: batch.batch_size]
+            y = batch.y[: batch.batch_size].view(-1).to(torch.long)
+            preds = out.argmax(dim=-1).cpu().numpy()
+            labels = y.cpu().numpy()
+        all_preds.append(preds)
+        all_labels.append(labels)
+    return np.concatenate(all_preds), np.concatenate(all_labels)
+
+def _plot_confusion(cm, class_names, save_path="confusion_matrix.png"):
+    """Plot ``cm`` (confusion matrix) and save to ``save_path``.
+
+    The matrix is visualised with a blue colormap and cell counts are
+    annotated.
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+    ax.set(
+        xticks=np.arange(len(class_names)),
+        yticks=np.arange(len(class_names)),
+        xlim=[-0.5, len(class_names) - 0.5],
+        ylim=[-0.5, len(class_names) - 0.5],
+        xticklabels=class_names,
+        yticklabels=class_names,
+        xlabel="Predicted label",
+        ylabel="True label",
+        title="Confusion Matrix",
+    )
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+    thresh = cm.max() / 2.0
+    for i, j in np.ndindex(cm.shape):
+        ax.text(j, i, f"{cm[i, j]}",
+                ha="center",
+                va="center",
+                color="white" if cm[i, j] > thresh else "black",
+                fontsize=12)
+    fig.tight_layout()
+    plt.savefig(save_path)
+    plt.close(fig)
 
 if __name__ == '__main__':
     # init DDP if needed
@@ -584,6 +652,16 @@ if __name__ == '__main__':
         print("Testing...")
         final_test_acc = test(model, test_loader, is_custom_dataset=is_custom_dataset)
         print(f'Test Accuracy: {final_test_acc:.4f}')
+        # -----------------------------------------------------------------
+        # Confusion matrix for the test set (saved as ``confusion_matrix.png``)
+        # -----------------------------------------------------------------
+        if safe_get_rank() == 0:
+            preds, labels = _gather_predictions(model, test_loader,
+                                            is_custom_dataset=is_custom_dataset)
+            cm = confusion_matrix(labels, preds)
+            class_names = [str(i) for i in range(cm.shape[0])]
+            _plot_confusion(cm, class_names, save_path="confusion_matrix.png")
+            print("Confusion matrix saved to confusion_matrix.png")
         total_time = round(time.perf_counter() - wall_clock_start, 2)
         print("Total Program Runtime (total_time) =", total_time, "seconds")
 
