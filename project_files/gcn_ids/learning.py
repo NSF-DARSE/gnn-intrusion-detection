@@ -289,40 +289,50 @@ def create_loader(
 
 
 def train(model, train_loader, optimizer, is_custom_dataset=False):
+    """Train for one epoch.
+
+    Returns the average loss and accuracy for the epoch. The implementation
+    normalises by the actual number of samples processed and converts all
+    tensors to Python scalars to avoid accidental tensor‑scalar mixing.
+    """
     model.train()
 
-    total_loss = total_correct = total_examples = 0
+    total_loss = 0.0
+    total_correct = 0
+    total_examples = 0
     for batch in train_loader:
         if is_custom_dataset:
             # Custom IDS dataset format
-            batch_x = batch.x.cuda()
-            batch_y = batch.y.cuda()
-            batch_edge_index = batch.edge_index.cuda()
-            
+            x = batch.x.cuda()
+            y = batch.y.cuda()
+            edge_index = batch.edge_index.cuda()
             optimizer.zero_grad()
-            out = model(batch_x, batch_edge_index)
-            loss = F.cross_entropy(out, batch_y.view(-1))
+            out = model(x, edge_index)
+            loss = F.cross_entropy(out, y.view(-1))
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * batch_y.size(0)
-            total_correct += out.argmax(dim=-1).eq(batch_y.view(-1)).sum().item()
-            total_examples += batch_y.size(0)
+            batch_sz = y.size(0)
+            total_loss += loss.item() * batch_sz
+            total_correct += out.argmax(dim=-1).eq(y.view(-1)).sum().item()
+            total_examples += batch_sz
         else:
             # OGB/cugraph_pyg format
             batch = batch.cuda()
             optimizer.zero_grad()
-            out = model(batch.x, batch.edge_index)[:batch.batch_size]
-            y = batch.y[:batch.batch_size].view(-1).to(torch.long)
+            out = model(batch.x, batch.edge_index)[: batch.batch_size]
+            y = batch.y[: batch.batch_size].view(-1).to(torch.long)
             loss = F.cross_entropy(out, y)
             loss.backward()
             optimizer.step()
 
-            total_loss += loss * y.size(0)
-            total_correct += out.argmax(dim=-1).eq(y).sum()
-            total_examples += y.size(0)
+            batch_sz = y.size(0)
+            total_loss += loss.item() * batch_sz
+            total_correct += out.argmax(dim=-1).eq(y).sum().item()
+            total_examples += batch_sz
 
-    #return total_loss.item() / total_examples, total_correct.item(
+    if total_examples == 0:
+        return 0.0, 0.0
     return total_loss / total_examples, total_correct / total_examples
 
 
@@ -661,7 +671,11 @@ if __name__ == '__main__':
             cm = confusion_matrix(labels, preds)
             class_names = [str(i) for i in range(cm.shape[0])]
             _plot_confusion(cm, class_names, save_path="confusion_matrix.png")
+            # Save raw predictions and labels for downstream analysis or download
+            np.save("test_predictions.npy", preds)
+            np.save("test_labels.npy", labels)
             print("Confusion matrix saved to confusion_matrix.png")
+            print("Predictions saved to test_predictions.npy and test_labels.npy")
         total_time = round(time.perf_counter() - wall_clock_start, 2)
         print("Total Program Runtime (total_time) =", total_time, "seconds")
 
