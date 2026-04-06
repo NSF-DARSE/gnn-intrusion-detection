@@ -96,3 +96,46 @@ for w in range(num_windows):
     plt.close()
 
 print(f"\nSuccess! Improved images have been saved to the '{output_dir}' folder.")
+
+# ---------------------------------------------------------------------
+# 7. Load predictions from the GCN training script and visualise overall
+#    classification statistics. The training script (`learning.py`) saves two
+#    NumPy files – `test_predictions.npy` (model predictions) and
+#    `test_labels.npy` (ground‑truth labels). We load them here to compute a
+#    simple bar‑chart of TP / TN / FP / FN counts.
+# ---------------------------------------------------------------------
+try:
+    import numpy as np
+    preds = np.load('test_predictions.npy')
+    labels = np.load('test_labels.npy')
+    if preds.shape != labels.shape:
+        raise ValueError('Prediction and label shapes differ')
+
+    # Derive status per node
+    status_counts = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
+    for p, l in zip(preds, labels):
+        if l == 1 and p == 1:
+            status_counts['TP'] += 1
+        elif l == 0 and p == 0:
+            status_counts['TN'] += 1
+        elif l == 0 and p == 1:
+            status_counts['FP'] += 1
+        elif l == 1 and p == 0:
+            status_counts['FN'] += 1
+
+    # Simple bar chart visualising the four categories
+    fig, ax = plt.subplots(figsize=(6, 4))
+    categories = list(status_counts.keys())
+    values = list(status_counts.values())
+    ax.bar(categories, values, color=['#ff3333', '#33cc33', '#ffaa00', '#888888'])
+    ax.set_ylabel('Count')
+    ax.set_title('Overall GCN Classification Summary')
+    summary_path = os.path.join(output_dir, 'overall_classification_summary.png')
+    plt.tight_layout()
+    plt.savefig(summary_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved overall classification summary to {summary_path}")
+except Exception as e:
+    # If the prediction files are missing we simply continue – the visualisation
+    # of the network windows still works.
+    print(f"Warning: could not load GCN predictions ({e}); skipping summary plot.")
