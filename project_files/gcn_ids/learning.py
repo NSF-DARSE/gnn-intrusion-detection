@@ -186,7 +186,7 @@ def init_distributed():
     # Initialize distributed only if world_size > 1
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size > 1:
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend="nccl", init_method="env://", device_id=local_rank)
         rank = os.environ['RANK']
         print(f"Initialized distributed: rank {rank}, world_size {world_size}")
     else:
