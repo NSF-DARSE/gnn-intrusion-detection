@@ -29,7 +29,7 @@ cupy.cuda.set_allocator(rmm_cupy_allocator)
 import cudf  # noqa
 import cugraph_pyg  # noqa
 import torch.nn.functional as F  # noqa
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 import matplotlib.pyplot as plt
 # Enable cudf spilling to save gpu memory
 #from cugraph_pyg.loader import NeighborLoader  # noqa
@@ -38,7 +38,7 @@ from ogb.nodeproppred import PygNodePropPredDataset  # noqa
 
 # Visualization utilities (optional, requires matplotlib & scikit-learn)
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 
 import torch_geometric  # noqa
 
@@ -186,7 +186,7 @@ def init_distributed():
     # Initialize distributed only if world_size > 1
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size > 1:
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend="nccl", init_method="env://", device_id=local_rank)
         rank = os.environ['RANK']
         print(f"Initialized distributed: rank {rank}, world_size {world_size}")
     else:
@@ -576,15 +576,15 @@ if __name__ == '__main__':
         )
         
         val_loader = PyGNeighborLoader(
-            data=data,
+            data=val_data,
             num_neighbors=num_neighbors,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=0,
         )
-        
+
         test_loader = PyGNeighborLoader(
-            data=data,
+            data=test_data,
             num_neighbors=num_neighbors,
             batch_size=args.batch_size,
             shuffle=False,
@@ -669,8 +669,17 @@ if __name__ == '__main__':
             preds, labels = _gather_predictions(model, test_loader,
                                             is_custom_dataset=is_custom_dataset)
             cm = confusion_matrix(labels, preds)
+            precision = precision_score(labels, preds, average='binary')
+            recall = recall_score(labels, preds, average='binary')
+            f1 = f1_score(labels, preds, average='binary')
+
             class_names = [str(i) for i in range(cm.shape[0])]
             _plot_confusion(cm, class_names, save_path="confusion_matrix.png")
+
+            print(f"Test Precision: {precision:.4f}")
+            print(f"Test Recall: {recall:.4f}")
+            print(f"Test F1 Score: {f1:.4f}")
+
             # Save raw predictions and labels for downstream analysis or download
             np.save("test_predictions.npy", preds)
             np.save("test_labels.npy", labels)
