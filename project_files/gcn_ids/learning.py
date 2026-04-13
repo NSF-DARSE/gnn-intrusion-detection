@@ -36,9 +36,6 @@ import matplotlib.pyplot as plt
 # Import OGB node property prediction dataset for standard benchmarks
 from ogb.nodeproppred import PygNodePropPredDataset  # noqa
 
-# Visualization utilities (optional, requires matplotlib & scikit-learn)
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 
 import torch_geometric  # noqa
 
@@ -159,10 +156,12 @@ def safe_get_world_size():
 def init_distributed():
     """Initialize distributed training if environment variables are set.
     Fallback to single-GPU mode otherwise.
+
+    Returns the device_id to use for barrier() calls.
     """
     # Already initialized ? nothing to do
     if dist.is_available() and dist.is_initialized():
-        return
+        return 0
 
     # Default env vars for single-GPU / single-process fallback
     default_env = {
@@ -178,15 +177,16 @@ def init_distributed():
     for k, v in default_env.items():
         os.environ.setdefault(k, v)
 
-    # Set CUDA device
+    # Set CUDA device and capture device_id
+    device_id = 0
     if torch.cuda.is_available():
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
+        device_id = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(device_id)
 
     # Initialize distributed only if world_size > 1
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size > 1:
-        dist.init_process_group(backend="nccl", init_method="env://", device_id=local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://", device_id=device_id)
         rank = os.environ['RANK']
         print(f"Initialized distributed: rank {rank}, world_size {world_size}")
     else:
@@ -194,7 +194,9 @@ def init_distributed():
 
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://", rank=0,
-                                world_size=1)
+                                world_size=1, device_id=device_id)
+
+    return device_id
 
 
 # ------------------------------------------------------
@@ -245,7 +247,7 @@ def arg_parse():
     parser.add_argument(
         "--model",
         type=str,
-        default='SAGE',
+        default='GCN',
         choices=[
             'SAGE',
             'GAT',
@@ -427,7 +429,7 @@ def _plot_confusion(cm, class_names, save_path="confusion_matrix.png"):
 
 if __name__ == '__main__':
     # init DDP if needed
-    init_distributed()
+    device_id = init_distributed()
 
     args = arg_parse()
     torch_geometric.seed_everything(123)
