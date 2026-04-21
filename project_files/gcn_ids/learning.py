@@ -36,9 +36,6 @@ import matplotlib.pyplot as plt
 # Import OGB node property prediction dataset for standard benchmarks
 from ogb.nodeproppred import PygNodePropPredDataset  # noqa
 
-# Visualization utilities (optional, requires matplotlib & scikit-learn)
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 
 import torch_geometric  # noqa
 
@@ -159,10 +156,12 @@ def safe_get_world_size():
 def init_distributed():
     """Initialize distributed training if environment variables are set.
     Fallback to single-GPU mode otherwise.
+
+    Returns the device_id to use for barrier() calls.
     """
     # Already initialized ? nothing to do
     if dist.is_available() and dist.is_initialized():
-        return
+        return 0
 
     # Default env vars for single-GPU / single-process fallback
     default_env = {
@@ -178,15 +177,16 @@ def init_distributed():
     for k, v in default_env.items():
         os.environ.setdefault(k, v)
 
-    # Set CUDA device
+    # Set CUDA device and capture device_id
+    device_id = 0
     if torch.cuda.is_available():
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
+        device_id = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(device_id)
 
     # Initialize distributed only if world_size > 1
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size > 1:
-        dist.init_process_group(backend="nccl", init_method="env://", device_id=local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://", device_id=device_id)
         rank = os.environ['RANK']
         print(f"Initialized distributed: rank {rank}, world_size {world_size}")
     else:
@@ -194,7 +194,9 @@ def init_distributed():
 
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://", rank=0,
-                                world_size=1)
+                                world_size=1, device_id=device_id)
+
+    return device_id
 
 
 # ------------------------------------------------------
@@ -207,8 +209,8 @@ def arg_parse():
         '--dataset',
         type=str,
         default='ids-custom',
-        choices=['ogbn-papers100M', 'ogbn-products', 'ogbn-arxiv', 'ids-custom'],
-        help='Dataset name. Use "ids-custom" for custom IDS data from data_graph.py.',
+        choices=['ogbn-papers100M', 'ogbn-products', 'ogbn-arxiv', 'ids-custom', 'ids-unsw-full'],
+        help='Dataset name. Use "ids-custom" or "ids-unsw-full" for custom IDS data.',
     )
     parser.add_argument(
         '--dataset_dir',
@@ -245,7 +247,7 @@ def arg_parse():
     parser.add_argument(
         "--model",
         type=str,
-        default='SAGE',
+        default='GCN',
         choices=[
             'SAGE',
             'GAT',
@@ -427,7 +429,7 @@ def _plot_confusion(cm, class_names, save_path="confusion_matrix.png"):
 
 if __name__ == '__main__':
     # init DDP if needed
-    init_distributed()
+    device_id = init_distributed()
 
     args = arg_parse()
     torch_geometric.seed_everything(123)
@@ -441,15 +443,32 @@ if __name__ == '__main__':
 
     wall_clock_start = time.perf_counter()
 
-    if args.dataset == 'ids-custom':
+    if args.dataset in ['ids-custom', 'ids-unsw-full']:
         # Load custom IDS dataset from data_graph.py pipeline
+        dataset_root = Path(args.dataset_dir)
+        
+        # If using unsw-full, we definitely want the subdirectory
+        if args.dataset == 'ids-unsw-full':
+            dataset_root = dataset_root / 'graph_unsw_full_10min'
+        elif args.dataset == 'ids-custom':
+            # Default path for ids-custom as requested
+            custom_path = dataset_root / 'graph_10min_moduleA'
+            if custom_path.exists():
+                dataset_root = custom_path
+            else:
+                # Fallback: check if we are at the parent level or already in the folder
+                if not (dataset_root / "graphs").exists():
+                    unsw_path = dataset_root / 'graph_unsw_full_10min'
+                    if (unsw_path / "graphs").exists():
+                        dataset_root = unsw_path
+
         if safe_get_rank() == 0:
-            print(f'Loading custom IDS dataset from: {args.dataset_dir}')
+            print(f'Loading custom IDS dataset from: {dataset_root}')
         
         # Load train, val, test splits
-        train_dataset = IDSWindowedDataset(args.dataset_dir, split='train')
-        val_dataset = IDSWindowedDataset(args.dataset_dir, split='val')
-        test_dataset = IDSWindowedDataset(args.dataset_dir, split='test')
+        train_dataset = IDSWindowedDataset(str(dataset_root), split='train')
+        val_dataset = IDSWindowedDataset(str(dataset_root), split='val')
+        test_dataset = IDSWindowedDataset(str(dataset_root), split='test')
         
         # Get data objects
         train_data = train_dataset[0]
@@ -460,7 +479,7 @@ if __name__ == '__main__':
         data = train_data
         
         if safe_get_rank() == 0:
-            print('Loaded IDS dataset:')
+            print(f'Loaded {args.dataset} dataset:')
             print(f'  Train: {train_data.num_nodes} nodes, {train_data.edge_index.shape[1]} edges')
             print(f'  Val: {val_data.num_nodes} nodes, {val_data.edge_index.shape[1]} edges')
             print(f'  Test: {test_data.num_nodes} nodes, {test_data.edge_index.shape[1]} edges')
@@ -520,7 +539,7 @@ if __name__ == '__main__':
         print(f"Training {args.dataset} with {args.model} model.")
 
     # Get dataset info based on dataset type
-    if args.dataset == 'ids-custom':
+    if args.dataset in ['ids-custom', 'ids-unsw-full']:
         num_features = data.x.shape[1]
         num_classes = 2  # Binary classification
     else:
@@ -559,7 +578,7 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                  weight_decay=args.wd)
 
-    if args.dataset == 'ids-custom':
+    if args.dataset in ['ids-custom', 'ids-unsw-full']:
         # For custom IDS dataset, use PyG's NeighborLoader for neighbor sampling
         # This properly handles sampling neighbors for each node in the batch
         
@@ -623,7 +642,7 @@ if __name__ == '__main__':
         dist.barrier()  # sync before training
 
     # Determine if using custom dataset
-    is_custom_dataset = (args.dataset == 'ids-custom')
+    is_custom_dataset = (args.dataset in ['ids-custom', 'ids-unsw-full'])
 
     if safe_get_rank() == 0:
         prep_time = round(time.perf_counter() - wall_clock_start, 2)
@@ -673,18 +692,51 @@ if __name__ == '__main__':
             recall = recall_score(labels, preds, average='binary')
             f1 = f1_score(labels, preds, average='binary')
 
-            class_names = [str(i) for i in range(cm.shape[0])]
-            _plot_confusion(cm, class_names, save_path="confusion_matrix.png")
+            class_names = ['Benign', 'Malicious'] if args.dataset in ['ids-custom', 'ids-unsw-full'] else [str(i) for i in range(cm.shape[0])]
+            
+            # Save confusion matrix with dataset-specific filename
+            cm_filename = f"confusion_matrix_{args.dataset}.png"
+            _plot_confusion(cm, class_names, save_path=cm_filename)
 
-            print(f"Test Precision: {precision:.4f}")
-            print(f"Test Recall: {recall:.4f}")
-            print(f"Test F1 Score: {f1:.4f}")
+            # Calculate test accuracy
+            test_acc = (preds == labels).mean()
+
+            # Format metrics for reporting
+            metrics_report = (
+                f"Dataset: {args.dataset}\n"
+                f"Model: {args.model}\n"
+                f"Epochs: {args.epochs}\n"
+                f"----------------------------\n"
+                f"Test Accuracy: {test_acc:.4f}\n"
+                f"Test Precision: {precision:.4f}\n"
+                f"Test Recall: {recall:.4f}\n"
+                f"Test F1 Score: {f1:.4f}\n"
+            )
+
+            print(metrics_report)
+            
+            # Save metrics to a text file
+            metrics_filename = f"metrics_{args.dataset}.txt"
+            with open(metrics_filename, "w") as f:
+                f.write(metrics_report)
+            print(f"Metrics report saved to {metrics_filename}")
 
             # Save raw predictions and labels for downstream analysis or download
-            np.save("test_predictions.npy", preds)
-            np.save("test_labels.npy", labels)
-            print("Confusion matrix saved to confusion_matrix.png")
-            print("Predictions saved to test_predictions.npy and test_labels.npy")
+            np.save(f"test_predictions_{args.dataset}.npy", preds)
+            np.save(f"test_labels_{args.dataset}.npy", labels)
+            
+            # Save the test window node counts for synchronization with visualization script
+            window_node_counts = []
+            test_graphs_dir = test_dataset.graphs_dir
+            for graph_file in sorted(test_graphs_dir.glob("*.npz")):
+                data_win = np.load(graph_file)
+                window_node_counts.append(data_win['node_features'].shape[0])
+            
+            np.save(f"test_window_node_counts_{args.dataset}.npy", np.array(window_node_counts))
+            
+            print(f"Confusion matrix saved to {cm_filename}")
+            print(f"Predictions saved to test_predictions_{args.dataset}.npy and test_labels_{args.dataset}.npy")
+            print(f"Window node counts saved to test_window_node_counts_{args.dataset}.npy")
         total_time = round(time.perf_counter() - wall_clock_start, 2)
         print("Total Program Runtime (total_time) =", total_time, "seconds")
 
