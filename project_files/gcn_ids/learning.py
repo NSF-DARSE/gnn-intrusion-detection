@@ -102,7 +102,11 @@ class IDSWindowedDataset:
         # Concatenate all arrays
         self.node_features = np.vstack(all_node_features)
         self.node_labels = np.concatenate(all_node_labels)
+        
+        # IMPORTANT: Fixed edge concatenation
+        # edge_index is (2, num_edges). We need to stack along the second axis.
         self.edge_index = np.hstack(all_edge_indices)
+        
         self.edge_features = np.vstack(all_edge_features) if all_edge_features[0].shape[0] > 0 else np.zeros((0, 10))
         
         # Convert to torch tensors
@@ -694,8 +698,8 @@ if __name__ == '__main__':
 
             class_names = ['Benign', 'Malicious'] if args.dataset in ['ids-custom', 'ids-unsw-full'] else [str(i) for i in range(cm.shape[0])]
             
-            # Save confusion matrix with dataset-specific filename
-            cm_filename = f"confusion_matrix_{args.dataset}.png"
+            # Save confusion matrix with dataset- and epoch-specific filename
+            cm_filename = f"confusion_matrix_{args.dataset}_{args.epochs}epochs.png"
             _plot_confusion(cm, class_names, save_path=cm_filename)
 
             # Calculate test accuracy
@@ -716,27 +720,30 @@ if __name__ == '__main__':
             print(metrics_report)
             
             # Save metrics to a text file
-            metrics_filename = f"metrics_{args.dataset}.txt"
+            metrics_filename = f"metrics_{args.dataset}_{args.epochs}epochs.txt"
             with open(metrics_filename, "w") as f:
                 f.write(metrics_report)
             print(f"Metrics report saved to {metrics_filename}")
 
-            # Save raw predictions and labels for downstream analysis or download
-            np.save(f"test_predictions_{args.dataset}.npy", preds)
-            np.save(f"test_labels_{args.dataset}.npy", labels)
+            # Save per-window predictions and labels for downstream analysis
+            preds_dir = Path(f"predictions_{args.dataset}")
+            preds_dir.mkdir(exist_ok=True)
             
-            # Save the test window node counts for synchronization with visualization script
-            window_node_counts = []
             test_graphs_dir = test_dataset.graphs_dir
-            for graph_file in sorted(test_graphs_dir.glob("*.npz")):
+            test_graph_files = sorted(test_graphs_dir.glob("*.npz"))
+            node_offset = 0
+            for w, graph_file in enumerate(test_graph_files):
                 data_win = np.load(graph_file)
-                window_node_counts.append(data_win['node_features'].shape[0])
-            
-            np.save(f"test_window_node_counts_{args.dataset}.npy", np.array(window_node_counts))
+                num_nodes_win = data_win['node_features'].shape[0]
+                win_preds = preds[node_offset:node_offset + num_nodes_win]
+                win_labels = labels[node_offset:node_offset + num_nodes_win]
+                np.save(preds_dir / f"window_{w:05d}_preds.npy", win_preds)
+                np.save(preds_dir / f"window_{w:05d}_labels.npy", win_labels)
+                node_offset += num_nodes_win
             
             print(f"Confusion matrix saved to {cm_filename}")
-            print(f"Predictions saved to test_predictions_{args.dataset}.npy and test_labels_{args.dataset}.npy")
-            print(f"Window node counts saved to test_window_node_counts_{args.dataset}.npy")
+            print(f"Metrics saved to {metrics_filename}")
+            print(f"Per-window predictions saved to {preds_dir}/")
         total_time = round(time.perf_counter() - wall_clock_start, 2)
         print("Total Program Runtime (total_time) =", total_time, "seconds")
 

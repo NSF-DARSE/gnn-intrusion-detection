@@ -44,17 +44,15 @@ num_windows = len(graph_files)
 print(f"Found {num_windows} test windows in {graphs_dir}")
 
 # ---------------------------------------------------------------------
-# GCN Integration: Load Predicted Labels
+# GCN Integration: Load Per-Window Predicted Labels
 # ---------------------------------------------------------------------
-print(f"Loading GCN predictions for {args.dataset}...")
-try:
-    gcn_preds = np.load(f'test_predictions_{args.dataset}.npy')
-    gcn_labels = np.load(f'test_labels_{args.dataset}.npy')
-    print("GCN predictions loaded successfully.")
-except Exception as e:
-    print(f"Warning: could not load GCN predictions ({e}).")
-    gcn_preds = None
-    gcn_labels = None
+preds_dir = Path(f"predictions_{args.dataset}")
+print(f"Loading per-window GCN predictions from {preds_dir}...")
+gcn_has_predictions = preds_dir.exists() and len(list(preds_dir.glob("*_preds.npy"))) > 0
+if not gcn_has_predictions:
+    print(f"Error: no per-window predictions found in {preds_dir}.")
+    print("Run learning.py first to generate predictions.")
+    exit(1)
 
 # 3. Process Each Window (.npz file)
 # We iterate through the files in the test directory
@@ -67,27 +65,15 @@ for w, graph_file in enumerate(graph_files):
     
     G = nx.DiGraph()
     
-    # Node mapping: Since the GCN combines all windows into one large graph, 
-    # the predictions are indexed by the total number of nodes across all windows.
-    # We need to find the offset for the current window to align predictions.
-    # However, for the visual representation of a single window's correctness,
-    # we can derive the status based on the labels and predictions of that window's slice.
-    
-    # Calculate total node offset for this window
-    node_offset = 0
-    if gcn_preds is not None:
-        # Load the predefined node counts instead of reloading every file in a loop
-        try:
-            window_counts = np.load(f'test_window_node_counts_{args.dataset}.npy')
-            node_offset = np.sum(window_counts[:w])
-        except Exception as e:
-            print(f"Warning: could not load window counts ({e}), falling back to manual scan.")
-            for prev_file in graph_files[:w]:
-                node_offset += np.load(prev_file)['node_features'].shape[0]
-    else:
-        # If no predictions, we don't strictly need the offset for the loop, 
-        # but we'll keep the logic for consistency.
-        node_offset = 0
+    # Load per-window GCN predictions directly
+    window_preds = None
+    window_labels = None
+    if gcn_has_predictions:
+        pred_path = preds_dir / f"window_{w:05d}_preds.npy"
+        label_path = preds_dir / f"window_{w:05d}_labels.npy"
+        if pred_path.exists() and label_path.exists():
+            window_preds = np.load(pred_path)
+            window_labels = np.load(label_path)
     
     num_nodes = node_labels.shape[0]
     
@@ -96,7 +82,7 @@ for w, graph_file in enumerate(graph_files):
     node_statuses = []
     for i in range(num_nodes):
         label = node_labels[i]
-        pred = gcn_preds[node_offset + i] if gcn_preds is not None else label # fallback to ground truth
+        pred = window_preds[i] if window_preds is not None else label  # fallback to ground truth
         
         if label == 1 and pred == 1: status = "TP"
         elif label == 0 and pred == 0: status = "TN"
@@ -108,8 +94,8 @@ for w, graph_file in enumerate(graph_files):
     for i in range(num_nodes):
         G.add_node(i, status=node_statuses[i])
         
-    for edge in edge_index:
-        G.add_edge(edge[0], edge[1])
+    for src, dst in edge_index.T:
+        G.add_edge(int(src), int(dst))
 
     # 4. Advanced Visualization Setup
     plt.figure(figsize=(14, 10))
@@ -175,14 +161,18 @@ for w, graph_file in enumerate(graph_files):
     plt.close()
 
 # ---------------------------------------------------------------------
-# 5. Load predictions and visualize statistics
+# 5. Aggregate per-window predictions and visualize statistics
 # ---------------------------------------------------------------------
-if gcn_preds is not None and gcn_labels is not None:
-    if gcn_preds.shape != gcn_labels.shape:
-        print("Prediction and label shapes differ, skipping summary plot.")
-    else:
-        status_counts = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
-        for p, l in zip(gcn_preds, gcn_labels):
+if gcn_has_predictions:
+    status_counts = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
+    for w in range(num_windows):
+        pred_path = preds_dir / f"window_{w:05d}_preds.npy"
+        label_path = preds_dir / f"window_{w:05d}_labels.npy"
+        if not pred_path.exists() or not label_path.exists():
+            continue
+        win_preds = np.load(pred_path)
+        win_labels = np.load(label_path)
+        for p, l in zip(win_preds, win_labels):
             if l == 1 and p == 1:
                 status_counts['TP'] += 1
             elif l == 0 and p == 0:
@@ -192,14 +182,14 @@ if gcn_preds is not None and gcn_labels is not None:
             elif l == 1 and p == 0:
                 status_counts['FN'] += 1
 
-        fig, ax = plt.subplots(figsize=(6, 4))
-        categories = list(status_counts.keys())
-        values = list(status_counts.values())
-        ax.bar(categories, values, color=['#ff3333', '#33cc33', '#ffaa00', '#888888'])
-        ax.set_ylabel('Count')
-        ax.set_title(f'Overall GCN Summary: {args.dataset}')
-        summary_path = os.path.join(output_dir, 'overall_classification_summary.png')
-        plt.tight_layout()
-        plt.savefig(summary_path, dpi=200)
-        plt.close(fig)
-        print(f"Saved overall classification summary to {summary_path}")
+    fig, ax = plt.subplots(figsize=(6, 4))
+    categories = list(status_counts.keys())
+    values = list(status_counts.values())
+    ax.bar(categories, values, color=['#ff3333', '#33cc33', '#ffaa00', '#888888'])
+    ax.set_ylabel('Count')
+    ax.set_title(f'Overall GCN Summary: {args.dataset}')
+    summary_path = os.path.join(output_dir, 'overall_classification_summary.png')
+    plt.tight_layout()
+    plt.savefig(summary_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved overall classification summary to {summary_path}")
