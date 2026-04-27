@@ -16,26 +16,22 @@ def get_args():
     return args
 
 
-def draw_single_window(win_id, edges, win_preds, win_labels, all_nodes, master_pos, output_dir):
+def draw_single_window(win_id, edges, win_preds, win_labels, master_pos, output_dir):
     """Draws a single window using a single CPU core."""
     G_win = nx.Graph()
-    G_win.add_nodes_from(all_nodes)
     G_win.add_edges_from(edges)
 
     node_categories = {}
-    for idx, node_id in enumerate(all_nodes):
-        if idx < len(win_preds):
-            p, label = win_preds[idx], win_labels[idx]
-            if label == 1 and p == 1:
-                cat = 'TP'
-            elif label == 0 and p == 0:
-                cat = 'TN'
-            elif label == 0 and p == 1:
-                cat = 'FP'
-            elif label == 1 and p == 0:
-                cat = 'FN'
-            else:
-                cat = 'TN'
+    for node_id in G_win.nodes():
+        p, label = win_preds[node_id], win_labels[node_id]
+        if label == 1 and p == 1:
+            cat = 'TP'
+        elif label == 0 and p == 0:
+            cat = 'TN'
+        elif label == 0 and p == 1:
+            cat = 'FP'
+        elif label == 1 and p == 0:
+            cat = 'FN'
         else:
             cat = 'TN'
         node_categories[node_id] = cat
@@ -43,29 +39,43 @@ def draw_single_window(win_id, edges, win_preds, win_labels, all_nodes, master_p
     COLOR_MAP = {'TP': '#d62728', 'TN': '#1f77b4', 'FP': '#ff7f0e', 'FN': '#2ca02c'}
     SHAPE_MAP = {'TP': 'o', 'TN': 's', 'FP': '^', 'FN': 'D'}
 
-    plt.figure(figsize=(14, 11), facecolor='white')
+    plt.figure(figsize=(16, 13), facecolor='white')
 
     nx.draw_networkx_edges(G_win, master_pos, alpha=0.4, edge_color='#a3a3a3', width=1.0)
 
-    for category in ['TP', 'TN', 'FP', 'FN']:
-        nodelist = [n for n in G_win.nodes() if node_categories.get(n, 'TN') == category]
-        if nodelist:
+    drawn_positions = set()
+
+    for category in ['TP', 'FN', 'FP', 'TN']:
+        nodes_in_cat = [n for n in G_win.nodes() if node_categories.get(n, 'TN') == category]
+        if nodes_in_cat:
+            nodelist = []
+            for n in nodes_in_cat:
+                pos_key = tuple(round(v, 6) for v in master_pos[n])
+                if pos_key not in drawn_positions:
+                    drawn_positions.add(pos_key)
+                    nodelist.append(n)
             nx.draw_networkx_nodes(
                 G_win, master_pos,
                 nodelist=nodelist,
                 node_color=COLOR_MAP[category],
                 node_shape=SHAPE_MAP[category],
-                node_size=800,
+                node_size=500,
                 edgecolors='black',
                 linewidths=1.5,
             )
 
-    nx.draw_networkx_labels(G_win, master_pos, font_size=11, font_weight='bold', font_color='white')
+    # Labels at positions that were actually drawn
+    labels_to_draw = {}
+    for node in G_win.nodes():
+        pos_key = tuple(round(v, 6) for v in master_pos[node])
+        if pos_key in drawn_positions and pos_key not in labels_to_draw:
+            labels_to_draw[node] = str(node)
+    nx.draw_networkx_labels(G_win, master_pos, labels=labels_to_draw, font_size=8, font_weight='bold', font_color='white')
 
-    active_nodes = len(set([u for u, v in edges]).union(set([v for u, v in edges])))
+    active_nodes = G_win.number_of_nodes()
     title_text = (
         f"Network Intrusion Analysis - Window {win_id}\n"
-        f"Total Nodes: {len(all_nodes)} | Active Nodes: {active_nodes} | Connections: {len(edges)}"
+        f"Total Nodes: {active_nodes} | Connections: {len(edges)}"
     )
     plt.title(title_text, fontsize=16, fontweight='bold', pad=20)
 
@@ -138,18 +148,16 @@ def main():
 
         num_nodes = data['node_features'].shape[0]
 
+        global_G.add_edges_from(edges)
+
         win_pred_path = preds_dir / f"window_{w:05d}_preds.npy"
         win_label_path = preds_dir / f"window_{w:05d}_labels.npy"
         win_preds = np.load(win_pred_path) if win_pred_path.exists() else np.zeros(num_nodes)
         win_labels = np.load(win_label_path) if win_label_path.exists() else np.zeros(num_nodes)
 
-        global_G.add_edges_from(edges)
-
         window_data_cache.append((w, edges, win_preds, win_labels))
 
-    all_nodes = list(global_G.nodes())
-
-    print("Calculating Stable Multi-Layer Layout...")
+    print("Calculating Stable Multi-Layer Layout with Spread...")
     node_degrees = dict(global_G.degree())
     sorted_nodes = sorted(node_degrees.items(), key=lambda x: x[1], reverse=True)
 
@@ -160,10 +168,18 @@ def main():
     nlist = [r for r in [core_hubs, inner_ring, outer_ring] if r]
     master_pos = nx.shell_layout(global_G, nlist=nlist)
 
+    # Jitter to break ties — deterministic per node ID
+    rng = np.random.default_rng(42)
+    for node in master_pos:
+        master_pos[node] = (
+            master_pos[node][0] + rng.uniform(-0.06, 0.06),
+            master_pos[node][1] + rng.uniform(-0.06, 0.06),
+        )
+
     print(f"Pass 2: Igniting {mp.cpu_count()} cores for High-Speed Generation...")
 
     tasks = [
-        (w, edges, win_preds, win_labels, all_nodes, master_pos, output_dir)
+        (w, edges, win_preds, win_labels, master_pos, output_dir)
         for (w, edges, win_preds, win_labels) in window_data_cache
     ]
 
