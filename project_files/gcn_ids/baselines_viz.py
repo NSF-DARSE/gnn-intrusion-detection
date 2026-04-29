@@ -1,10 +1,12 @@
-import networkx as nx
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+import argparse
 import os
 import numpy as np
-import argparse
+import networkx as nx
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
 from pathlib import Path
+import multiprocessing as mp
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -13,193 +15,209 @@ def get_args():
     args = parser.parse_args()
     return args
 
-# 1. Setup Output Folder
-args = get_args()
-output_dir = f"improved_network_windows_{args.dataset}"
-os.makedirs(output_dir, exist_ok=True)
 
-# 2. Setup Dataset Path
-dataset_root = Path(args.dataset_dir)
-if args.dataset == 'ids-unsw-full':
-    dataset_root = dataset_root / 'graph_unsw_full_10min'
-elif args.dataset == 'ids-custom':
-    # Prioritize the specific moduleA folder if it exists
-    custom_path = dataset_root / 'graph_10min_moduleA'
-    if custom_path.exists():
-        dataset_root = custom_path
-    else:
-        # Fallback logic to match learning.py
-        if not (dataset_root / "graphs").exists():
-            unsw_path = dataset_root / 'graph_unsw_full_10min'
-            if (unsw_path / "graphs").exists():
-                dataset_root = unsw_path
+def draw_single_window(win_id, edges, win_preds, win_labels, master_pos, output_dir):
+    """Draws a single window using a single CPU core."""
+    G_win = nx.Graph()
+    G_win.add_edges_from(edges)
 
-graphs_dir = dataset_root / "graphs" / "test"
-if not graphs_dir.exists():
-    raise ValueError(f"Test graph directory not found: {graphs_dir}")
+    node_categories = {}
+    for node_id in G_win.nodes():
+        p, label = win_preds[node_id], win_labels[node_id]
+        if label == 1 and p == 1:
+            cat = 'TP'
+        elif label == 0 and p == 0:
+            cat = 'TN'
+        elif label == 0 and p == 1:
+            cat = 'FP'
+        elif label == 1 and p == 0:
+            cat = 'FN'
+        else:
+            cat = 'TN'
+        node_categories[node_id] = cat
 
-# Load all .npz files in the test directory
-graph_files = sorted(list(graphs_dir.glob("*.npz")))
-num_windows = len(graph_files)
-print(f"Found {num_windows} test windows in {graphs_dir}")
+    COLOR_MAP = {'TP': '#d62728', 'TN': '#1f77b4', 'FP': '#ff7f0e', 'FN': '#2ca02c'}
+    SHAPE_MAP = {'TP': 'o', 'TN': 's', 'FP': '^', 'FN': 'D'}
 
-# ---------------------------------------------------------------------
-# GCN Integration: Load Predicted Labels
-# ---------------------------------------------------------------------
-print(f"Loading GCN predictions for {args.dataset}...")
-try:
-    gcn_preds = np.load(f'test_predictions_{args.dataset}.npy')
-    gcn_labels = np.load(f'test_labels_{args.dataset}.npy')
-    print("GCN predictions loaded successfully.")
-except Exception as e:
-    print(f"Warning: could not load GCN predictions ({e}).")
-    gcn_preds = None
-    gcn_labels = None
+    plt.figure(figsize=(16, 13), facecolor='white')
 
-# 3. Process Each Window (.npz file)
-# We iterate through the files in the test directory
-for w, graph_file in enumerate(graph_files):
-    data = np.load(graph_file)
-    
-    # Load components from .npz
-    node_labels = data['node_labels']
-    edge_index = data['edge_index']
-    
-    G = nx.DiGraph()
-    
-    # Node mapping: Since the GCN combines all windows into one large graph, 
-    # the predictions are indexed by the total number of nodes across all windows.
-    # We need to find the offset for the current window to align predictions.
-    # However, for the visual representation of a single window's correctness,
-    # we can derive the status based on the labels and predictions of that window's slice.
-    
-    # Calculate total node offset for this window
-    node_offset = 0
-    if gcn_preds is not None:
-        # Load the predefined node counts instead of reloading every file in a loop
-        try:
-            window_counts = np.load(f'test_window_node_counts_{args.dataset}.npy')
-            node_offset = np.sum(window_counts[:w])
-        except Exception as e:
-            print(f"Warning: could not load window counts ({e}), falling back to manual scan.")
-            for prev_file in graph_files[:w]:
-                node_offset += np.load(prev_file)['node_features'].shape[0]
-    else:
-        # If no predictions, we don't strictly need the offset for the loop, 
-        # but we'll keep the logic for consistency.
-        node_offset = 0
-    
-    num_nodes = node_labels.shape[0]
-    
-    # Determine node status for this window
-    # TP: label=1, pred=1 | TN: label=0, pred=0 | FP: label=0, pred=1 | FN: label=1, pred=0
-    node_statuses = []
-    for i in range(num_nodes):
-        label = node_labels[i]
-        pred = gcn_preds[node_offset + i] if gcn_preds is not None else label # fallback to ground truth
-        
-        if label == 1 and pred == 1: status = "TP"
-        elif label == 0 and pred == 0: status = "TN"
-        elif label == 0 and pred == 1: status = "FP"
-        else: status = "FN"
-        node_statuses.append(status)
+    nx.draw_networkx_edges(G_win, master_pos, alpha=0.4, edge_color='#a3a3a3', width=1.0)
 
-    # Build the graph
-    for i in range(num_nodes):
-        G.add_node(i, status=node_statuses[i])
-        
-    for edge in edge_index:
-        G.add_edge(edge[0], edge[1])
+    drawn_positions = set()
 
-    # 4. Advanced Visualization Setup
-    plt.figure(figsize=(14, 10))
-    num_nodes = G.number_of_nodes()
-    num_edges = G.number_of_edges()
-    plt.title(f"Dataset: {args.dataset} | Window {w + 1} - Nodes: {num_nodes}, Edges: {num_edges}",
-              fontsize=20, fontweight='bold', pad=20)
+    for category in ['TP', 'FN', 'FP', 'TN']:
+        nodes_in_cat = [n for n in G_win.nodes() if node_categories.get(n, 'TN') == category]
+        if nodes_in_cat:
+            nodelist = []
+            for n in nodes_in_cat:
+                pos_key = tuple(round(v, 6) for v in master_pos[n])
+                if pos_key not in drawn_positions:
+                    drawn_positions.add(pos_key)
+                    nodelist.append(n)
+            nx.draw_networkx_nodes(
+                G_win, master_pos,
+                nodelist=nodelist,
+                node_color=COLOR_MAP[category],
+                node_shape=SHAPE_MAP[category],
+                node_size=500,
+                edgecolors='black',
+                linewidths=1.5,
+            )
 
-    pos = nx.spring_layout(G, k=0.8, iterations=75, seed=42)
+    # Labels at positions that were actually drawn
+    labels_to_draw = {}
+    for node in G_win.nodes():
+        pos_key = tuple(round(v, 6) for v in master_pos[node])
+        if pos_key in drawn_positions and pos_key not in labels_to_draw:
+            labels_to_draw[node] = str(node)
+    nx.draw_networkx_labels(G_win, master_pos, labels=labels_to_draw, font_size=8, font_weight='bold', font_color='white')
 
-    color_map = {
-        'TP': '#ff3333',  # Red
-        'TN': '#33cc33',  # Green
-        'FP': '#ffaa00',  # Orange
-        'FN': '#888888'   # Gray
-    }
-    shape_map = {
-        'TP': 'o',  # Circle
-        'TN': 's',  # Square
-        'FP': '^',  # Triangle
-        'FN': 'X'   # Cross
-    }
-    
-    nx.draw_networkx_edges(G, pos, alpha=0.3, width=1.0, edge_color="#777777", arrows=True, arrowsize=12)
+    active_nodes = G_win.number_of_nodes()
+    title_text = (
+        f"Network Intrusion Analysis - Window {win_id}\n"
+        f"Total Nodes: {active_nodes} | Connections: {len(edges)}"
+    )
+    plt.title(title_text, fontsize=16, fontweight='bold', pad=20)
 
-    # To draw different shapes, we must loop through the status categories
-    for status, shape in shape_map.items():
-        nodes_of_status = [n for n in G.nodes() if G.nodes[n]['status'] == status]
-        if not nodes_of_status:
-            continue
-            
-        # Get sizes for this specific group
-        node_sizes = [min(G.degree[n] * 15 + 40, 600) for n in nodes_of_status]
-        
-        nx.draw_networkx_nodes(
-            G, pos, 
-            nodelist=nodes_of_status, 
-            node_color=color_map[status], 
-            node_size=node_sizes, 
-            node_shape=shape,
-            edgecolors='black', 
-            linewidths=1.5
-        )
-
-    # Use Line2D to create legend markers that match the node shapes
-    from matplotlib.lines import Line2D
-    
     legend_elements = [
-        Line2D([0], [0], marker='o', color='w', label='TP (True Positive - Malicious)',
-               markerfacecolor='#ff3333', markersize=12, markeredgecolor='black'),
-        Line2D([0], [0], marker='s', color='w', label='TN (True Negative - Benign)',
-               markerfacecolor='#33cc33', markersize=12, markeredgecolor='black'),
-        Line2D([0], [0], marker='^', color='w', label='FP (False Positive - False Alarm)',
-               markerfacecolor='#ffaa00', markersize=12, markeredgecolor='black'),
-        Line2D([0], [0], marker='X', color='w', label='FN (False Negative - Missed Attack)',
-               markerfacecolor='#888888', markersize=12, markeredgecolor='black'),
+        mlines.Line2D([], [], color='w', marker='o', markerfacecolor='#d62728', markersize=12, markeredgecolor='black', label='TP (Correct Attack)'),
+        mlines.Line2D([], [], color='w', marker='s', markerfacecolor='#1f77b4', markersize=12, markeredgecolor='black', label='TN (Correct Safe)'),
+        mlines.Line2D([], [], color='w', marker='^', markerfacecolor='#ff7f0e', markersize=12, markeredgecolor='black', label='FP (False Alarm)'),
+        mlines.Line2D([], [], color='w', marker='D', markerfacecolor='#2ca02c', markersize=12, markeredgecolor='black', label='FN (Missed Attack)'),
     ]
-    plt.legend(handles=legend_elements, loc='upper right', fontsize=12, framealpha=0.9)
+    plt.legend(handles=legend_elements, loc='upper right', fontsize=11, framealpha=0.9, title="Prediction Profile")
 
     plt.axis('off')
-    output_path = os.path.join(output_dir, f"Test_{w + 1:02d}.png")
-    plt.savefig(output_path, dpi=200, bbox_inches='tight', facecolor='white')
+
+    output_path = os.path.join(output_dir, f"Window_{win_id:04d}.png")
+    plt.savefig(output_path, dpi=120, bbox_inches='tight')
     plt.close()
 
-# ---------------------------------------------------------------------
-# 5. Load predictions and visualize statistics
-# ---------------------------------------------------------------------
-if gcn_preds is not None and gcn_labels is not None:
-    if gcn_preds.shape != gcn_labels.shape:
-        print("Prediction and label shapes differ, skipping summary plot.")
-    else:
-        status_counts = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
-        for p, l in zip(gcn_preds, gcn_labels):
-            if l == 1 and p == 1:
+    return f"Window {win_id} saved."
+
+
+def main():
+    args = get_args()
+
+    output_dir = f"improved_network_windows_{args.dataset}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    dataset_root = Path(args.dataset_dir)
+    if args.dataset == 'ids-unsw-full':
+        dataset_root = dataset_root / 'graph_unsw_full_10min'
+    elif args.dataset == 'ids-custom':
+        custom_path = dataset_root / 'graph_10min_moduleA'
+        if custom_path.exists():
+            dataset_root = custom_path
+        else:
+            if not (dataset_root / "graphs").exists():
+                unsw_path = dataset_root / 'graph_unsw_full_10min'
+                if (unsw_path / "graphs").exists():
+                    dataset_root = unsw_path
+
+    graphs_dir = dataset_root / "graphs" / "test"
+    if not graphs_dir.exists():
+        raise ValueError(f"Test graph directory not found: {graphs_dir}")
+
+    npz_files = sorted(list(graphs_dir.glob("*.npz")))
+    num_windows = len(npz_files)
+    print(f"Found {num_windows} test windows in {graphs_dir}")
+
+    preds_dir = Path(f"predictions_{args.dataset}")
+    print(f"Loading per-window GCN predictions from {preds_dir}...")
+    gcn_has_predictions = preds_dir.exists() and len(list(preds_dir.glob("*_preds.npy"))) > 0
+    if not gcn_has_predictions:
+        print(f"Error: no per-window predictions found in {preds_dir}.")
+        print("Run learning.py first to generate predictions.")
+        return
+
+    print("Pass 1: Extracting global network topology...")
+    global_G = nx.Graph()
+    window_data_cache = []
+
+    for w, npz_file in enumerate(npz_files):
+        data = np.load(npz_file)
+
+        if 'edge_index' in data:
+            src, dst = data['edge_index']
+            edges = list(zip(src.tolist(), dst.tolist()))
+        else:
+            adj = data['adj_matrix'].item() if data['adj_matrix'].ndim == 0 else data['adj_matrix']
+            coo = adj.tocoo()
+            edges = list(zip(coo.row.tolist(), coo.col.tolist()))
+
+        num_nodes = data['node_features'].shape[0]
+
+        global_G.add_edges_from(edges)
+
+        win_pred_path = preds_dir / f"window_{w:05d}_preds.npy"
+        win_label_path = preds_dir / f"window_{w:05d}_labels.npy"
+        win_preds = np.load(win_pred_path) if win_pred_path.exists() else np.zeros(num_nodes)
+        win_labels = np.load(win_label_path) if win_label_path.exists() else np.zeros(num_nodes)
+
+        window_data_cache.append((w, edges, win_preds, win_labels))
+
+    print("Calculating Stable Multi-Layer Layout with Spread...")
+    node_degrees = dict(global_G.degree())
+    sorted_nodes = sorted(node_degrees.items(), key=lambda x: x[1], reverse=True)
+
+    core_hubs = [n for n, deg in sorted_nodes[:3]]
+    inner_ring = [n for n, deg in sorted_nodes[3:15]] if len(sorted_nodes) > 3 else []
+    outer_ring = [n for n, deg in sorted_nodes[15:]] if len(sorted_nodes) > 15 else []
+
+    nlist = [r for r in [core_hubs, inner_ring, outer_ring] if r]
+    master_pos = nx.shell_layout(global_G, nlist=nlist)
+
+    # Jitter to break ties — deterministic per node ID
+    rng = np.random.default_rng(42)
+    for node in master_pos:
+        master_pos[node] = (
+            master_pos[node][0] + rng.uniform(-0.06, 0.06),
+            master_pos[node][1] + rng.uniform(-0.06, 0.06),
+        )
+
+    print(f"Pass 2: Igniting {mp.cpu_count()} cores for High-Speed Generation...")
+
+    tasks = [
+        (w, edges, win_preds, win_labels, master_pos, output_dir)
+        for (w, edges, win_preds, win_labels) in window_data_cache
+    ]
+
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        results = pool.starmap(draw_single_window, tasks)
+
+    print(f"\nSUCCESS! {len(results)} Pro-Level images saved to '{output_dir}'.")
+
+    status_counts = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
+    for w in range(num_windows):
+        pred_path = preds_dir / f"window_{w:05d}_preds.npy"
+        label_path = preds_dir / f"window_{w:05d}_labels.npy"
+        if not pred_path.exists() or not label_path.exists():
+            continue
+        win_preds = np.load(pred_path)
+        win_labels = np.load(label_path)
+        for p, label in zip(win_preds, win_labels):
+            if label == 1 and p == 1:
                 status_counts['TP'] += 1
-            elif l == 0 and p == 0:
+            elif label == 0 and p == 0:
                 status_counts['TN'] += 1
-            elif l == 0 and p == 1:
+            elif label == 0 and p == 1:
                 status_counts['FP'] += 1
-            elif l == 1 and p == 0:
+            elif label == 1 and p == 0:
                 status_counts['FN'] += 1
 
-        fig, ax = plt.subplots(figsize=(6, 4))
-        categories = list(status_counts.keys())
-        values = list(status_counts.values())
-        ax.bar(categories, values, color=['#ff3333', '#33cc33', '#ffaa00', '#888888'])
-        ax.set_ylabel('Count')
-        ax.set_title(f'Overall GCN Summary: {args.dataset}')
-        summary_path = os.path.join(output_dir, 'overall_classification_summary.png')
-        plt.tight_layout()
-        plt.savefig(summary_path, dpi=200)
-        plt.close(fig)
-        print(f"Saved overall classification summary to {summary_path}")
+    fig, ax = plt.subplots(figsize=(6, 4))
+    categories = list(status_counts.keys())
+    values = list(status_counts.values())
+    ax.bar(categories, values, color=['#ff3333', '#33cc33', '#ffaa00', '#888888'])
+    ax.set_ylabel('Count')
+    ax.set_title(f'Overall GCN Summary: {args.dataset}')
+    summary_path = os.path.join(output_dir, 'overall_classification_summary.png')
+    plt.tight_layout()
+    plt.savefig(summary_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved overall classification summary to {summary_path}")
+
+
+if __name__ == '__main__':
+    main()
