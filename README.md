@@ -1,104 +1,201 @@
 # GNN Intrusion Detection
 
-An end-to-end graph neural network workflow for intrusion detection in network traffic.
+This repository contains a small end-to-end graph neural network workflow for
+intrusion detection.
 
-This project converts raw network-flow CSV data into graph datasets, trains a graph convolutional network (GCN) for node-level malicious IP detection, and renders test-set graph visualizations from model predictions.
+The project is organized into three modules:
 
-## Team Modules
+- **Module A**: clean raw network-flow CSV files and convert them into graph
+  datasets
+- **Module B**: train and evaluate a graph convolutional network (GCN) on those
+  graph datasets
+- **Module C**: visualize test-set predictions as network graphs
 
-- `gcn_ids/data_graph.py` - Module A: data cleaning, graph building, split generation
-- `gcn_ids/learning.py` - Module B: GCN training, validation, testing, metrics, plots
-- `gcn_ids/graph_viz.py` - Module C: test-set network graph visualizations
-- `main.py` - orchestration entry point for Module A -> Module B -> Module C
+The goal of this README is to make the repo easy to understand for the next
+person who picks it up.
 
-## Repository Structure
+## 1. What The Project Does
+
+The pipeline starts with raw flow tables and ends with model metrics and test
+graph visualizations:
+
+```text
+Raw CSV flows
+  -> Module A (clean + build graph windows)
+  -> Module B (train / validate / test GCN)
+  -> Module C (visualize test predictions)
+```
+
+Each graph window is a directed communication graph:
+
+- **nodes** = IP addresses
+- **edges** = observed flows between IPs in a fixed time window
+
+## 2. Main Files You Should Know
+
+### Core code
+
+- `gcn_ids/data_graph.py`
+  - Module A
+  - cleans input data
+  - builds graph windows
+  - creates node and edge features
+  - writes train / val / test graph artifacts
+
+- `gcn_ids/learning.py`
+  - Module B
+  - loads graph artifacts from Module A
+  - trains a 2-layer GCN
+  - writes metrics, predictions, and plots
+
+- `gcn_ids/graph_viz.py`
+  - Module C
+  - reads Module B predictions
+  - creates test-set graph visualizations
+
+- `main.py`
+  - convenience entry point that runs Module A -> Module B -> Module C
+
+### Tests
+
+- `tests/test_data_graph.py`
+  - current automated tests are strongest for Module A
+
+### Documentation
+
+- `docs/project_onboarding.md`
+  - best starting point for a future teammate
+- `docs/module_a_documentation.md`
+- `docs/module_b_documentation.md`
+- `docs/module_c_documentation.md`
+- `docs/integration_report.md`
+
+## 3. Repository Structure
 
 ```text
 gcn_ids/
+  __init__.py
   data_graph.py
   learning.py
   graph_viz.py
+
 docs/
+  project_onboarding.md
   module_a_documentation.md
+  module_b_documentation.md
+  module_c_documentation.md
   integration_report.md
+  figures/
+
 scripts/
   run_module_a_windows.ps1
   run_module_a_mac.sh
+  build_merged_dataset.py
+  build_node_window_dataset.py
+  visualize_flow_windows.py
+
 tests/
   test_data_graph.py
+
 main.py
 requirements.txt
 pyproject.toml
+README.md
 CHANGELOG.md
 RELEASE_NOTES.md
+LICENSE
 ```
 
-## Supported Datasets
+## 4. Datasets Used In This Project
 
-This repo was used with two graph-dataset builds:
+This repo was used with two datasets during the project:
 
-1. `UNSW-NB15`
-   - mentor-selected main dataset
-   - full raw shard support
-   - latest clean build: `data/graph_unsw_full_10min_stratified_clean`
+### A. UNSW-NB15
 
-2. `ids-custom` / IoT-style dataset
-   - used for a secondary modeling check
-   - latest build: `data/graph_10min_moduleA_stratified`
+- mentor-selected main dataset
+- used for the main graph/GCN workflow
+- latest cleaned graph build:
+  - `data/graph_unsw_full_10min_stratified_clean/`
 
-## Workflow Overview
+### B. IoT / ids-custom style dataset
 
-1. Raw CSV flow data is cleaned and normalized.
-2. Flows are grouped into fixed time windows.
-3. Each window becomes one directed graph:
-   - nodes = IP addresses
-   - edges = observed flows
-4. Node and edge features are aggregated per window.
-5. Graph windows are split into train, validation, and test sets.
-6. A 2-layer GCN is trained on Module A outputs.
-7. Test predictions are visualized as TP/TN/FP/FN network graphs.
+- used as a secondary dataset during experimentation
+- latest graph build:
+  - `data/graph_10min_moduleA_stratified/`
 
-## Module A Summary
+If you are continuing this project, start with the **UNSW-NB15** workflow
+unless your team explicitly wants the IoT branch.
 
-Module A creates graph artifacts with:
+## 5. What Module A Produces
 
-- 14 node features
-- 10 edge features
-- per-window `.npz` graph files
-- `schema.json`
-- `node_mapping.json`
-- scaler files
-- `manifest.json`
+Module A writes a graph dataset folder that looks like this:
 
-Module A supports both:
+```text
+graph_build/
+  graphs/
+    train/
+      window_*.npz
+    val/
+      window_*.npz
+    test/
+      window_*.npz
+  manifest.json
+  schema.json
+  node_mapping.json
+  scaler_node.pkl
+  scaler_edge.pkl
+```
 
-- `temporal` splitting
-- `stratified_attack_presence` splitting
+Each `.npz` graph file contains:
 
-For full documentation, see:
+- `node_features`
+- `node_labels`
+- `edge_index`
+- `edge_features`
 
-- `docs/module_a_documentation.md`
+Module B reads these files directly.
 
-## Main Results Included In This Workspace
+## 6. What Module B Produces
 
-### UNSW-NB15 stratified build
+Module B writes a results folder like this:
 
-- cleaned flows: `2,540,047`
-- windows: `149`
-- split: `89 train / 30 val / 30 test`
-- attack-window distribution: `50 / 17 / 17`
+```text
+module_b_results/
+  gcn_model.pt
+  metrics.json
+  test_predictions.csv
+  training_history.csv
+  training_curves.png
+  confusion_matrix.png
+```
 
-### IoT stratified build
+This gives you:
 
-- split ratio: `60 / 20 / 20`
-- attack-window distribution: `39 / 13 / 13`
-- downstream GCN improvement confirmed by Module B:
-  - recall improved from `0.4144` to `0.6488`
-  - F1 improved from `0.5529` to `0.7268`
+- saved model weights
+- test metrics
+- node-level predictions
+- training/validation curves
+- confusion matrix
 
-## Installation
+## 7. What Module C Produces
 
-Create a virtual environment and install the dependencies:
+Module C writes:
+
+```text
+module_c_test_viz/
+  test_graph_01_*.png
+  test_graph_02_*.png
+  ...
+  viz_summary.json
+```
+
+These are **test-set-only** visualizations based on Module B predictions.
+
+## 8. Quick Start
+
+### Install dependencies
+
+Mac/Linux:
 
 ```bash
 python3 -m venv .venv
@@ -106,7 +203,7 @@ source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 ```
 
-On Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
 py -m venv .venv
@@ -114,9 +211,7 @@ py -m venv .venv
 py -m pip install -r requirements.txt
 ```
 
-## Quickstart
-
-### Run the full integrated workflow
+### Run the full UNSW workflow
 
 ```bash
 python3 main.py \
@@ -128,7 +223,9 @@ python3 main.py \
   --seed 42
 ```
 
-### Run Module A only
+## 9. Run Each Module Separately
+
+### Module A only
 
 ```bash
 python3 gcn_ids/data_graph.py \
@@ -142,7 +239,7 @@ python3 gcn_ids/data_graph.py \
   --seed 42
 ```
 
-### Run Module B only
+### Module B only
 
 ```bash
 python3 gcn_ids/learning.py \
@@ -152,7 +249,7 @@ python3 gcn_ids/learning.py \
   --seed 42
 ```
 
-### Run Module C only
+### Module C only
 
 ```bash
 python3 gcn_ids/graph_viz.py \
@@ -163,48 +260,89 @@ python3 gcn_ids/graph_viz.py \
   --layout-seed 42
 ```
 
-## Testing
+## 10. Testing
 
-Run the current Module A test suite:
+Current automated tests focus on Module A.
+
+Run them with:
 
 ```bash
 python3 -m pytest -q tests/test_data_graph.py
 ```
 
-Expected result:
+Expected result in this workspace:
 
 ```text
 8 passed
 ```
 
-## Reproducibility Notes
+Why these tests matter:
 
-- all major commands support a fixed `--seed`
-- graph scalers are fit on train split only
-- artifact metadata is recorded in `manifest.json`
-- model metrics are recorded in `metrics.json`
-- train/validation curves and confusion matrix are saved as PNGs
+- they verify split logic
+- they verify artifact creation
+- they verify UNSW raw shard support
+- they help confirm that Module B receives the graph inputs it expects
 
-## Documentation
+## 11. Current Results In This Workspace
 
-- `docs/module_a_documentation.md` - detailed Module A documentation
-- `docs/module_a_handoff.md` - teammate handoff instructions
-- `docs/integration_report.md` - integrated workflow summary
+### UNSW stratified-clean run
 
-## Figures
+The current workspace includes a completed end-to-end run under:
 
-Representative output figures are included in `docs/figures/`:
+- `data/graph_unsw_full_10min_stratified_clean/`
 
-- `training_curves.png` - 50-epoch training and validation curves
-- `confusion_matrix.png` - test-set confusion matrix
-- `test_graph_example.png` - Module C test-set graph visualization
+Recent test metrics from Module B:
 
-## Release Readiness
+- accuracy: `0.9993`
+- malicious precision: `0.9958`
+- malicious recall: `1.0000`
+- malicious F1: `0.9979`
 
-This workspace now includes:
+Confusion matrix:
 
+```text
+[[1231, 1],
+ [   0, 238]]
+```
+
+### Included figures
+
+- `docs/figures/training_curves.png`
+- `docs/figures/confusion_matrix.png`
+- `docs/figures/test_graph_example.png`
+
+## 12. Reproducibility Notes
+
+- major commands support a fixed `--seed`
+- graph scaling is fit on **train split only**
+- metadata is written to `manifest.json`
+- model metrics are written to `metrics.json`
+- plots are saved as PNGs
+
+## 13. Known Limitations
+
+- automated tests currently cover Module A more thoroughly than Module B or C
+- this repo contains traces of earlier project phases and older local artifacts
+- the presentation used by the team may summarize the project differently than
+  this repository layout; this README describes the code as it exists here
+
+## 14. If You Are Continuing This Project
+
+Start here:
+
+1. read `docs/project_onboarding.md`
+2. read this `README.md`
+3. inspect `gcn_ids/data_graph.py`, `gcn_ids/learning.py`, and
+   `gcn_ids/graph_viz.py`
+4. run the Module A tests
+5. run the pipeline on the existing UNSW graph build before changing code
+
+## 15. Additional Docs
+
+- `docs/project_onboarding.md`
+- `docs/module_a_documentation.md`
+- `docs/module_b_documentation.md`
+- `docs/module_c_documentation.md`
+- `docs/integration_report.md`
 - `CHANGELOG.md`
 - `RELEASE_NOTES.md`
-- `pyproject.toml`
-
-These support the course rubric categories around documentation, release notes, and packaging readiness.
