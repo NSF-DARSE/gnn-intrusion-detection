@@ -25,7 +25,6 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-
 LOGGER = logging.getLogger("data_graph")
 
 
@@ -225,7 +224,7 @@ class EdgeAgg:
 
 def _normalize_key(name: str) -> str:
     key = name.strip().lower()
-    key = key.replace("_", " ")
+    key = key.replace("_", " ").replace(".", " ")
     key = re.sub(r"\s+", " ", key)
     return key
 
@@ -444,6 +443,17 @@ def load_and_clean_csvs(
         original_rows = len(df)
         rename_map = canonicalize_columns(df.columns)
         df = df.rename(columns=rename_map)
+
+        # Deduplicate columns that map to the same canonical name (e.g. orig_bytes + orig_ip_bytes).
+        dedup_cols: Dict[str, List[str]] = defaultdict(list)
+        for c in df.columns:
+            dedup_cols[c].append(c)
+        for col, dupes in dedup_cols.items():
+            if len(dupes) > 1:
+                LOGGER.warning("Merging %d duplicate columns for '%s'", len(dupes), col)
+                numeric = df[dupes].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+                df[col] = numeric.max(axis=1)
+                df = df.loc[:, ~df.columns.duplicated(keep="first")].copy()
 
         required = ["Source IP", "Destination IP", "Timestamp"]
         missing = [c for c in required if c not in df.columns]
@@ -760,12 +770,17 @@ def save_graph_npz(path: Path, graph: Dict[str, np.ndarray]) -> None:
 
 def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
     input_files: List[Path] = []
+    missing_files: List[str] = []
     for item in args.input_files:
         p = Path(item)
-        if p.is_dir():
+        if not p.exists():
+            missing_files.append(item)
+        elif p.is_dir():
             input_files.extend(sorted(p.glob(args.input_glob)))
         else:
             input_files.append(p)
+    if missing_files:
+        raise FileNotFoundError(f"Input file(s) not found: {', '.join(missing_files)}")
     input_files = sorted(set(input_files))
     if not input_files:
         raise ValueError("No input files found.")

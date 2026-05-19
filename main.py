@@ -86,8 +86,6 @@ def main() -> None:
             "gcn_ids/graph_viz.py",
             "--graph-dir",
             str(args.graph_dir),
-            "--predictions-csv",
-            str(args.results_dir / "test_predictions.csv"),
             "--output-dir",
             str(args.viz_dir),
             "--max-graphs",

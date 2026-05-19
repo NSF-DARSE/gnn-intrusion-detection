@@ -1,322 +1,765 @@
-#!/usr/bin/env python3
-"""Module B: train, validate, and test a windowed GCN node classifier."""
-
-from __future__ import annotations
-
 import argparse
-import csv
-import json
+
 import os
-import random
-from dataclasses import dataclass
+import os.path as osp
+import time
 from pathlib import Path
-from typing import Dict, Iterable, List
 
-import matplotlib
-
-os.environ.setdefault("MPLCONFIGDIR", str(Path(".matplotlib-cache").resolve()))
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 import numpy as np
+import psutil
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
+import torch.distributed as dist
+import torch_geometric
+from torch_geometric.data import Data
+from torch_geometric.loader import NeighborLoader as PyGNeighborLoader
+from pdb import set_trace
+#set_trace()  # Debugging breakpoint to inspect environment variables and device setup
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+if torch.cuda.is_available():
+    import cupy
+    import rmm
+    from rmm.allocators.cupy import rmm_cupy_allocator
+    from rmm.allocators.torch import rmm_torch_allocator
+    rmm.reinitialize(devices=[0], pool_allocator=True, managed_memory=True)
+    cupy.cuda.set_allocator(rmm_cupy_allocator)
+
+    import cudf  # noqa
+    import cugraph_pyg  # noqa
+    cudf.set_option("spill", True)
+
+import torch.nn.functional as F  # noqa
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+import matplotlib.pyplot as plt
+from ogb.nodeproppred import PygNodePropPredDataset  # noqa
 
 
-@dataclass
-class GraphData:
-    file: Path
-    x: torch.Tensor
-    y: torch.Tensor
-    adj: torch.Tensor
-    edge_index: np.ndarray
+import torch_geometric  # noqa
 
 
-class GCN(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, out_dim)
-        self.dropout = dropout
+class IDSWindowedDataset:
+    """Dataset class for loading windowed graph data from data_graph.py pipeline.
+    
+    Loads .npz files containing:
+    - node_features: Node feature matrix
+    - node_labels: Node labels (0=benign, 1=malicious)
+    - edge_index: Edge index in COO format (2 x num_edges)
+    - edge_features: Edge feature matrix
+    """
+    
+    def __init__(self, root_dir: str, split: str = "train"):
+        """
+        Args:
+            root_dir: Root directory containing graphs/{split}/ subdirectories
+            split: Split name ('train', 'val', or 'test')
+        """
+        self.root_dir = Path(root_dir)
+        self.split = split
+        self.graphs_dir = self.root_dir / "graphs" / split
+        
+        if not self.graphs_dir.exists():
+            raise ValueError(f"Graph directory not found: {self.graphs_dir}")
+        
+        # Load all .npz files in the split directory
+        self.graph_files = sorted(self.graphs_dir.glob("*.npz"))
+        if not self.graph_files:
+            raise ValueError(f"No .npz files found in {self.graphs_dir}")
+        
+        # Load the first graph as the main data object
+        # For windowed data, we typically train on one window at a time
+        # or concatenate all windows into a single graph
+        self._load_graphs()
+    
+    def _load_graphs(self):
+        """Load all graphs from .npz files and combine into a single Data object."""
+        all_node_features = []
+        all_node_labels = []
+        all_edge_indices = []
+        all_edge_features = []
+        node_offset = 0
+        
+        for graph_file in self.graph_files:
+            data = np.load(graph_file)
+            
+            num_nodes = data['node_features'].shape[0]
+            
+            all_node_features.append(data['node_features'])
+            all_node_labels.append(data['node_labels'])
+            
+            # Adjust edge indices for node offset
+            edge_index = data['edge_index'].astype(np.int64).copy()
+            edge_index[:] += node_offset
+            all_edge_indices.append(edge_index)
+            
+            all_edge_features.append(data['edge_features'])
+            node_offset += num_nodes
+        
+        # Concatenate all arrays
+        self.node_features = np.vstack(all_node_features)
+        self.node_labels = np.concatenate(all_node_labels)
+        
+        # IMPORTANT: Fixed edge concatenation
+        # edge_index is (2, num_edges). We need to stack along the second axis.
+        self.edge_index = np.hstack(all_edge_indices)
+        
+        self.edge_features = np.vstack(all_edge_features) if all_edge_features[0].shape[0] > 0 else np.zeros((0, 10))
+        
+        # Convert to torch tensors
+        self.x = torch.tensor(self.node_features, dtype=torch.float32)
+        self.y = torch.tensor(self.node_labels, dtype=torch.long)
+        self.edge_index = torch.tensor(self.edge_index, dtype=torch.long)
+        self.edge_attr = torch.tensor(self.edge_features, dtype=torch.float32) if self.edge_features.shape[0] > 0 else torch.zeros((0, 10), dtype=torch.float32)
+        
+        self.num_nodes = self.x.shape[0]
+        self.num_features = self.x.shape[1]
+        self.num_classes = 2  # Binary classification: benign vs malicious
+        
+        # Create split indices (all nodes in this split are used)
+        self.split_idx = {
+            'train': torch.arange(self.num_nodes) if self.split == 'train' else torch.tensor([], dtype=torch.long),
+            'valid': torch.arange(self.num_nodes) if self.split == 'val' else torch.tensor([], dtype=torch.long),
+            'test': torch.arange(self.num_nodes) if self.split == 'test' else torch.tensor([], dtype=torch.long),
+        }
+    
+    def __getitem__(self, idx):
+        """Return a PyG Data object."""
+        data = Data()
+        data.x = self.x
+        data.y = self.y
+        data.edge_index = self.edge_index
+        data.edge_attr = self.edge_attr
+        data.num_nodes = self.num_nodes
+        return data
+    
+    def __len__(self):
+        return 1
+    
+    def get_idx_split(self):
+        """Return split indices."""
+        return self.split_idx
+    
+    @property
+    def num_graphs(self):
+        return len(self.graph_files)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        h = torch.matmul(adj, x)
-        h = F.relu(self.fc1(h))
-        h = F.dropout(h, p=self.dropout, training=self.training)
-        h = torch.matmul(adj, h)
-        return self.fc2(h)
+
+# ---------------- Distributed helpers ----------------
+def safe_get_rank():
+    return dist.get_rank() if dist.is_initialized() else 0
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(False)
+def safe_get_world_size():
+    return dist.get_world_size() if dist.is_initialized() else 1
 
 
-def normalized_adjacency(edge_index: np.ndarray, num_nodes: int) -> torch.Tensor:
-    adj = np.zeros((num_nodes, num_nodes), dtype=np.float32)
-    if edge_index.size:
-        for src, dst in edge_index.T:
-            adj[int(src), int(dst)] = 1.0
-            adj[int(dst), int(src)] = 1.0
-    adj += np.eye(num_nodes, dtype=np.float32)
-    degree = adj.sum(axis=1)
-    inv_sqrt = np.power(degree, -0.5, where=degree > 0)
-    inv_sqrt[degree == 0] = 0.0
-    adj = inv_sqrt[:, None] * adj * inv_sqrt[None, :]
-    return torch.from_numpy(adj)
+def init_distributed():
+    """Initialize distributed training if environment variables are set.
+    Fallback to single-process mode otherwise.
 
+    Returns the device_id to use for barrier() calls.
+    """
+    if dist.is_available() and dist.is_initialized():
+        return 0
 
-def load_split(graph_dir: Path, split: str) -> List[GraphData]:
-    graphs: List[GraphData] = []
-    for file_path in sorted((graph_dir / "graphs" / split).glob("window_*.npz")):
-        arrays = np.load(file_path)
-        x_np = arrays["node_features"].astype(np.float32)
-        y_np = arrays["node_labels"].astype(np.int64)
-        edge_index = arrays["edge_index"].astype(np.int64)
-        graphs.append(
-            GraphData(
-                file=file_path,
-                x=torch.from_numpy(x_np),
-                y=torch.from_numpy(y_np),
-                adj=normalized_adjacency(edge_index, x_np.shape[0]),
-                edge_index=edge_index,
-            )
-        )
-    if not graphs:
-        raise ValueError(f"No graph files found for split '{split}' in {graph_dir}")
-    return graphs
-
-
-def iter_labels(graphs: Iterable[GraphData]) -> np.ndarray:
-    return np.concatenate([g.y.numpy() for g in graphs])
-
-
-def class_weights(train_graphs: List[GraphData]) -> torch.Tensor:
-    y = iter_labels(train_graphs)
-    counts = np.bincount(y, minlength=2).astype(np.float32)
-    weights = counts.sum() / np.maximum(counts, 1.0)
-    weights = weights / weights.mean()
-    return torch.tensor(weights, dtype=torch.float32)
-
-
-def run_epoch(model: GCN, graphs: List[GraphData], optimizer: torch.optim.Optimizer, criterion: nn.Module) -> Dict[str, float]:
-    model.train()
-    total_loss = 0.0
-    y_true: List[int] = []
-    y_pred: List[int] = []
-
-    for graph in graphs:
-        optimizer.zero_grad()
-        logits = model(graph.x, graph.adj)
-        loss = criterion(logits, graph.y)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += float(loss.item())
-        y_true.extend(graph.y.numpy().tolist())
-        y_pred.extend(logits.argmax(dim=1).detach().numpy().tolist())
-
-    return {"loss": total_loss / len(graphs), "accuracy": accuracy_score(y_true, y_pred)}
-
-
-@torch.no_grad()
-def evaluate(model: GCN, graphs: List[GraphData], criterion: nn.Module) -> Dict[str, object]:
-    model.eval()
-    total_loss = 0.0
-    rows: List[Dict[str, object]] = []
-    y_true: List[int] = []
-    y_pred: List[int] = []
-
-    for graph in graphs:
-        logits = model(graph.x, graph.adj)
-        loss = criterion(logits, graph.y)
-        probs = torch.softmax(logits, dim=1)[:, 1]
-        preds = logits.argmax(dim=1)
-
-        total_loss += float(loss.item())
-        true_np = graph.y.numpy()
-        pred_np = preds.numpy()
-        prob_np = probs.numpy()
-        y_true.extend(true_np.tolist())
-        y_pred.extend(pred_np.tolist())
-
-        for node_idx, (label, pred, prob) in enumerate(zip(true_np, pred_np, prob_np)):
-            rows.append(
-                {
-                    "graph_file": str(graph.file),
-                    "node_idx": node_idx,
-                    "true_label": int(label),
-                    "pred_label": int(pred),
-                    "prob_malicious": float(prob),
-                }
-            )
-
-    precision, recall, f1, _support = precision_recall_fscore_support(
-        y_true,
-        y_pred,
-        labels=[0, 1],
-        zero_division=0,
-    )
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    return {
-        "loss": total_loss / len(graphs),
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision_benign": float(precision[0]),
-        "precision_malicious": float(precision[1]),
-        "recall_benign": float(recall[0]),
-        "recall_malicious": float(recall[1]),
-        "f1_benign": float(f1[0]),
-        "f1_malicious": float(f1[1]),
-        "confusion_matrix": cm.astype(int).tolist(),
-        "predictions": rows,
+    default_env = {
+        "RANK": "0",
+        "LOCAL_RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_WORLD_SIZE": "1",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "29500"
     }
 
+    for k, v in default_env.items():
+        os.environ.setdefault(k, v)
 
-def plot_curves(history: List[Dict[str, float]], output_path: Path) -> None:
-    epochs = [h["epoch"] for h in history]
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-    axes[0].plot(epochs, [h["train_loss"] for h in history], label="Train")
-    axes[0].plot(epochs, [h["val_loss"] for h in history], label="Validation")
-    axes[0].set_title("Loss Across 50 Epochs")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Cross-entropy loss")
-    axes[0].legend()
+    device_id = 0
+    #set_trace()
+    if torch.cuda.is_available():
+        device_id = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(device_id)
 
-    axes[1].plot(epochs, [h["train_accuracy"] for h in history], label="Train")
-    axes[1].plot(epochs, [h["val_accuracy"] for h in history], label="Validation")
-    axes[1].set_title("Accuracy Across 50 Epochs")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Accuracy")
-    axes[1].set_ylim(0.0, 1.0)
-    axes[1].legend()
-    fig.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
+    world_size = int(os.environ["WORLD_SIZE"])
+    if world_size > 1:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://", device_id=device_id)
+        rank = os.environ['RANK']
+        print(f"Initialized distributed: rank {rank}, world_size {world_size}, backend={backend}", flush=True)
+    else:
+        print("Running in single-process mode (CPU)" if not torch.cuda.is_available() else "Running in single-GPU / single-process mode", flush=True)
 
+    if not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://", rank=0,
+                                world_size=1, device_id=device_id)
 
-def plot_confusion_matrix(cm: List[List[int]], output_path: Path) -> None:
-    arr = np.asarray(cm)
-    fig, ax = plt.subplots(figsize=(5.5, 5))
-    image = ax.imshow(arr, cmap="Blues")
-    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_xticks([0, 1], labels=["Benign", "Malicious"])
-    ax.set_yticks([0, 1], labels=["Benign", "Malicious"])
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("Actual")
-    ax.set_title("Test Confusion Matrix")
-    for row in range(2):
-        for col in range(2):
-            ax.text(col, row, str(arr[row, col]), ha="center", va="center", color="black", fontweight="bold")
-    fig.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
+    return device_id
 
 
-def save_history(history: List[Dict[str, float]], output_path: Path) -> None:
-    with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
-        writer.writeheader()
-        writer.writerows(history)
-
-
-def save_predictions(rows: List[Dict[str, object]], output_path: Path) -> None:
-    with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["graph_file", "node_idx", "true_label", "pred_label", "prob_malicious"])
-        writer.writeheader()
-        writer.writerows(rows)
+# ------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train a two-layer GCN on Module A graph artifacts.")
-    parser.add_argument("--graph-dir", type=Path, required=True, help="Module A output directory.")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for Module B outputs.")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--hidden-dim", type=int, default=32)
-    parser.add_argument("--dropout", type=float, default=0.25)
-    parser.add_argument("--lr", type=float, default=0.01)
-    parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--seed", type=int, default=42)
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter, )
+    parser.add_argument('--graph-dir', type=Path, default=None,
+                        help='Module A output directory (replaces --dataset_dir).')
+    parser.add_argument('--output-dir', type=Path, default=None,
+                        help='Directory for Module B outputs.')
+    parser.add_argument(
+        '--dataset',
+        type=str,
+        default='ids-custom',
+        choices=['ogbn-papers100M', 'ogbn-products', 'ogbn-arxiv', 'ids-custom', 'ids-unsw-full'],
+        help='Dataset name. Use "ids-custom" or "ids-unsw-full" for custom IDS data.',
+    )
+    parser.add_argument(
+        '--dataset_dir',
+        type=str,
+        default='/workspace/data',
+        help='Root directory of dataset.',
+    )
+    parser.add_argument(
+        "--dataset_subdir",
+        type=str,
+        default="",
+        help="Subdirectory of dataset (for OGB datasets). Ignored for ids-custom.",
+    )
+    parser.add_argument('-e', '--epochs', type=int, default=50)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--num_layers', type=int, default=3)
+    parser.add_argument('-b', '--batch_size', type=int, default=1024)
+    parser.add_argument('--fan_out', type=int, default=10)
+    parser.add_argument('--hidden_channels', type=int, default=256)
+    parser.add_argument('--hidden-dim', type=int, default=256)
+    parser.add_argument('--lr', type=float, default=0.003)
+    parser.add_argument('--wd', type=float, default=0.0,
+                        help='weight decay for the optimizer')
+    parser.add_argument('--weight-decay', type=float, default=0.0)
+    parser.add_argument('--dropout', type=float, default=0.5)
+    parser.add_argument('--num_workers', type=int, default=12)
+    parser.add_argument(
+        '--use_directed_graph',
+        action='store_true',
+        help='Whether or not to use directed graph',
+    )
+    parser.add_argument(
+        '--add_self_loop',
+        action='store_true',
+        help='Whether or not to add self loop',
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default='GCN',
+        choices=[
+            'SAGE',
+            'GAT',
+            'GCN',
+        ],
+        help="Model used for training, default GCN",
+    )
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=1,
+        help="If using GATConv or GT, number of attention heads to use",
+    )
+    parser.add_argument('--tempdir_root', type=str, default=None)
     return parser
 
 
-def main() -> None:
+def create_loader(
+    input_nodes,
+    stage_name,
+    data,
+    num_neighbors,
+    replace,
+    batch_size,
+    shuffle=False,
+):
+    if safe_get_rank() == 0:
+        print(f'Creating {stage_name} loader...', flush=True)
+
+    return PyGNeighborLoader(
+        data,
+        num_neighbors=num_neighbors,
+        input_nodes=input_nodes,
+        replace=replace,
+        batch_size=batch_size,
+        shuffle=shuffle,
+    )
+
+
+def train(model, train_loader, optimizer, is_custom_dataset=False):
+    """Train for one epoch.
+
+    Returns the average loss and accuracy for the epoch. The implementation
+    normalises by the actual number of samples processed and converts all
+    tensors to Python scalars to avoid accidental tensor‑scalar mixing.
+    """
+    model.train()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_examples = 0
+    for batch in train_loader:
+        if is_custom_dataset:
+            x = batch.x.to(DEVICE)
+            y = batch.y.to(DEVICE)
+            edge_index = batch.edge_index.to(DEVICE)
+            optimizer.zero_grad()
+            out = model(x, edge_index)
+            loss = F.cross_entropy(out, y.view(-1))
+            loss.backward()
+            optimizer.step()
+
+            batch_sz = y.size(0)
+            total_loss += loss.item() * batch_sz
+            total_correct += out.argmax(dim=-1).eq(y.view(-1)).sum().item()
+            total_examples += batch_sz
+        else:
+            batch = batch.to(DEVICE)
+            optimizer.zero_grad()
+            out = model(batch.x, batch.edge_index)[: batch.batch_size]
+            y = batch.y[: batch.batch_size].view(-1).to(torch.long)
+            loss = F.cross_entropy(out, y)
+            loss.backward()
+            optimizer.step()
+
+            batch_sz = y.size(0)
+            total_loss += loss.item() * batch_sz
+            total_correct += out.argmax(dim=-1).eq(y).sum().item()
+            total_examples += batch_sz
+
+    if total_examples == 0:
+        return 0.0, 0.0
+    return total_loss / total_examples, total_correct / total_examples
+
+
+@torch.no_grad()
+def test(model, loader, is_custom_dataset=False):
+    model.eval()
+
+    total_correct = total_examples = 0
+    for batch in loader:
+        if is_custom_dataset:
+            batch_x = batch.x.to(DEVICE)
+            batch_y = batch.y.to(DEVICE)
+            batch_edge_index = batch.edge_index.to(DEVICE)
+            
+            out = model(batch_x, batch_edge_index)
+            total_correct += out.argmax(dim=-1).eq(batch_y.view(-1)).sum().item()
+            total_examples += batch_y.size(0)
+        else:
+            batch = batch.to(DEVICE)
+            out = model(batch.x, batch.edge_index)[:batch.batch_size]
+            y = batch.y[:batch.batch_size].view(-1).to(torch.long)
+
+            total_correct += out.argmax(dim=-1).eq(y).sum()
+            total_examples += y.size(0)
+
+    return total_correct / total_examples
+
+# ---------------------------------------------------------------------
+# Visualization helpers (confusion matrix)
+# ---------------------------------------------------------------------
+def _gather_predictions(model, loader, is_custom_dataset=False):
+    """Run ``model`` on ``loader`` and collect predictions and true labels.
+
+    Returns two NumPy arrays: ``preds`` and ``labels``. Used after training to
+    compute a confusion matrix.
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    for batch in loader:
+        if is_custom_dataset:
+            x = batch.x.to(DEVICE)
+            y = batch.y.to(DEVICE)
+            edge_index = batch.edge_index.to(DEVICE)
+            out = model(x, edge_index)
+            preds = out.argmax(dim=-1).cpu().numpy()
+            labels = y.view(-1).cpu().numpy()
+        else:
+            batch = batch.to(DEVICE)
+            out = model(batch.x, batch.edge_index)[: batch.batch_size]
+            y = batch.y[: batch.batch_size].view(-1).to(torch.long)
+            preds = out.argmax(dim=-1).cpu().numpy()
+            labels = y.cpu().numpy()
+        all_preds.append(preds)
+        all_labels.append(labels)
+    return np.concatenate(all_preds), np.concatenate(all_labels)
+
+def _plot_confusion(cm, class_names, save_path="confusion_matrix.png"):
+    """Plot ``cm`` (confusion matrix) and save to ``save_path``.
+
+    The matrix is visualised with a blue colormap and cell counts are
+    annotated.
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+    ax.set(
+        xticks=np.arange(len(class_names)),
+        yticks=np.arange(len(class_names)),
+        xlim=[-0.5, len(class_names) - 0.5],
+        ylim=[-0.5, len(class_names) - 0.5],
+        xticklabels=class_names,
+        yticklabels=class_names,
+        xlabel="Predicted label",
+        ylabel="True label",
+        title="Confusion Matrix",
+    )
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+    thresh = cm.max() / 2.0
+    for i, j in np.ndindex(cm.shape):
+        ax.text(j, i, f"{cm[i, j]}",
+                ha="center",
+                va="center",
+                color="white" if cm[i, j] > thresh else "black",
+                fontsize=12)
+    fig.tight_layout()
+    plt.savefig(save_path)
+    plt.close(fig)
+
+if __name__ == '__main__':
+    # init DDP if needed
+    #print("hello", flush=True)
+    device_id = init_distributed()
+
     args = build_parser().parse_args()
-    set_seed(args.seed)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.hidden_dim != 256:
+        args.hidden_channels = args.hidden_dim
+    if args.weight_decay != 0.0:
+        args.wd = args.weight_decay
+    skip_subdir = args.graph_dir is not None
+    if args.graph_dir is not None:
+        args.dataset_dir = str(args.graph_dir)
+    torch_geometric.seed_everything(args.seed)
 
-    train_graphs = load_split(args.graph_dir, "train")
-    val_graphs = load_split(args.graph_dir, "val")
-    test_graphs = load_split(args.graph_dir, "test")
+    if "papers" in str(args.dataset) and (psutil.virtual_memory().total /
+                                          (1024**3)) < 390:
+        if safe_get_rank() == 0:
+            print("Warning: may not have enough RAM to use this many GPUs.", flush=True)
+            print("Consider upgrading RAM if an error occurs.", flush=True)
+            print("Estimated RAM Needed: ~390GB.", flush=True)
 
-    in_dim = train_graphs[0].x.shape[1]
-    model = GCN(in_dim=in_dim, hidden_dim=args.hidden_dim, out_dim=2, dropout=args.dropout)
-    criterion = nn.CrossEntropyLoss(weight=class_weights(train_graphs))
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    wall_clock_start = time.perf_counter()
 
-    history: List[Dict[str, float]] = []
-    best_val = -1.0
-    best_state = None
+    if args.dataset in ['ids-custom', 'ids-unsw-full']:
+        # Load custom IDS dataset from data_graph.py pipeline
+        dataset_root = Path(args.dataset_dir)
+        
+        # If using unsw-full, we definitely want the subdirectory
+        if args.dataset == 'ids-unsw-full':
+            dataset_root = dataset_root / 'graph_unsw_full_10min'
+        elif args.dataset == 'ids-custom' and not skip_subdir:
+            # Default path for ids-custom as requested
+            custom_path = dataset_root / 'graph_10min_moduleA_stratified'
+            if custom_path.exists():
+                dataset_root = custom_path
+            else:
+                # Fallback: check if we are at the parent level or already in the folder
+                if not (dataset_root / "graphs").exists():
+                    unsw_path = dataset_root / 'graph_unsw_full_10min'
+                    if (unsw_path / "graphs").exists():
+                        dataset_root = unsw_path
+
+        if safe_get_rank() == 0:
+            print(f'Loading custom IDS dataset from: {dataset_root}', flush=True)
+        
+        # Load train, val, test splits
+        train_dataset = IDSWindowedDataset(str(dataset_root), split='train')
+        val_dataset = IDSWindowedDataset(str(dataset_root), split='val')
+        test_dataset = IDSWindowedDataset(str(dataset_root), split='test')
+        
+        # Get data objects
+        train_data = train_dataset[0]
+        val_data = val_dataset[0]
+        test_data = test_dataset[0]
+        
+        # Use train data as the main data object
+        data = train_data
+        
+        if safe_get_rank() == 0:
+            print(f'Loaded {args.dataset} dataset:', flush=True)
+            print(f'  Train: {train_data.num_nodes} nodes, {train_data.edge_index.shape[1]} edges', flush=True)
+            print(f'  Val: {val_data.num_nodes} nodes, {val_data.edge_index.shape[1]} edges', flush=True)
+            print(f'  Test: {test_data.num_nodes} nodes, {test_data.edge_index.shape[1]} edges', flush=True)
+            print(f'  Node features: {train_data.x.shape[1]}, Classes: {train_dataset.num_classes}', flush=True)
+        
+        # Create split indices for training
+        split_idx = {
+            'train': torch.arange(train_data.num_nodes),
+            'valid': torch.arange(val_data.num_nodes),
+            'test': torch.arange(test_data.num_nodes),
+        }
+        
+        # Store datasets for later use
+        datasets = {'train': train_dataset, 'val': val_dataset, 'test': test_dataset}
+        
+    else:
+        root = osp.join(args.dataset_dir, args.dataset_subdir)
+
+        if safe_get_rank() == 0:
+            print('The root is: ', root, flush=True)
+
+        torch.serialization.add_safe_globals([torch_geometric.data.data.DataEdgeAttr])
+        torch.serialization.add_safe_globals([torch_geometric.data.data.DataTensorAttr])
+        torch.serialization.add_safe_globals([torch_geometric.data.storage.GlobalStorage])
+
+        dataset = PygNodePropPredDataset(name=args.dataset, root=root)
+        split_idx = dataset.get_idx_split()
+
+        data = dataset[0]
+        if not args.use_directed_graph:
+            data.edge_index = torch_geometric.utils.to_undirected(
+                data.edge_index, reduce="mean")
+        if args.add_self_loop:
+            data.edge_index, _ = torch_geometric.utils.remove_self_loops(
+                data.edge_index)
+            data.edge_index, _ = torch_geometric.utils.add_self_loops(
+                data.edge_index, num_nodes=data.num_nodes)
+        
+        if torch.cuda.is_available():
+            graph_store = cugraph_pyg.data.GraphStore()
+            graph_store[dict(
+                edge_type=('node', 'rel', 'node'),
+                layout='coo',
+                is_sorted=False,
+                size=(data.num_nodes, data.num_nodes),
+            )] = data.edge_index
+
+            feature_store = cugraph_pyg.data.FeatureStore()
+            feature_store['node', 'x', None] = data.x
+            feature_store['node', 'y', None] = data.y
+
+            data = (feature_store, graph_store)
+        datasets = None
+
+    if safe_get_rank() == 0:
+        print(f"Training {args.dataset} with {args.model} model.", flush=True)
+
+    # Get dataset info based on dataset type
+    if args.dataset in ['ids-custom', 'ids-unsw-full']:
+        num_features = data.x.shape[1]
+        num_classes = 2  # Binary classification
+    else:
+        num_features = dataset.num_features
+        num_classes = dataset.num_classes
+
+    if args.model == "GAT":
+        model = torch_geometric.nn.models.GAT(num_features,
+                                              args.hidden_channels,
+                                              args.num_layers,
+                                              num_classes,
+                                              heads=args.num_heads).to(DEVICE)
+    elif args.model == "GCN":
+        model = torch_geometric.nn.models.GCN(num_features,
+                                              args.hidden_channels,
+                                              args.num_layers,
+                                              num_classes).to(DEVICE)
+    elif args.model == "SAGE":
+        model = torch_geometric.nn.models.GraphSAGE(
+            num_features, args.hidden_channels, args.num_layers,
+            num_classes).to(DEVICE)
+    elif args.model == 'SGFormer':
+        model = torch_geometric.nn.models.SGFormer(
+            in_channels=num_features,
+            hidden_channels=args.hidden_channels,
+            out_channels=num_classes,
+            trans_num_heads=args.num_heads,
+            trans_dropout=args.dropout,
+            gnn_num_layers=args.num_layers,
+            gnn_dropout=args.dropout,
+        ).to(DEVICE)
+    else:
+        raise ValueError(f'Unsupported model type: {args.model}')
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
+                                 weight_decay=args.wd)
+
+    if args.dataset in ['ids-custom', 'ids-unsw-full']:
+        # For custom IDS dataset, use PyG's NeighborLoader for neighbor sampling
+        # This properly handles sampling neighbors for each node in the batch
+        
+        num_neighbors = [args.fan_out] * args.num_layers
+        
+        # Create NeighborLoaders for each split
+        # The loader will sample neighbors for nodes in each batch
+        train_loader = PyGNeighborLoader(
+            data=data,
+            num_neighbors=num_neighbors,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+        )
+        
+        val_loader = PyGNeighborLoader(
+            data=val_data,
+            num_neighbors=num_neighbors,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+
+        test_loader = PyGNeighborLoader(
+            data=test_data,
+            num_neighbors=num_neighbors,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+        
+    else:
+        if torch.cuda.is_available():
+            graph_store = cugraph_pyg.data.GraphStore()
+            graph_store[dict(
+                edge_type=('node', 'rel', 'node'),
+                layout='coo',
+                is_sorted=False,
+                size=(data.num_nodes, data.num_nodes),
+            )] = data.edge_index
+
+            feature_store = cugraph_pyg.data.FeatureStore()
+            feature_store['node', 'x', None] = data.x
+            feature_store['node', 'y', None] = data.y
+
+            data = (feature_store, graph_store)
+
+        loader_kwargs = dict(
+            data=data,
+            num_neighbors=[args.fan_out] * args.num_layers,
+            replace=False,
+            batch_size=args.batch_size,
+        )
+
+        train_loader = create_loader(split_idx['train'], 'train', **loader_kwargs,
+                                     shuffle=True)
+        val_loader = create_loader(split_idx['valid'], 'val', **loader_kwargs)
+        test_loader = create_loader(split_idx['test'], 'test', **loader_kwargs)
+
+    if dist.is_initialized():
+        dist.barrier()  # sync before training
+
+    # Determine if using custom dataset
+    is_custom_dataset = (args.dataset in ['ids-custom', 'ids-unsw-full'])
+
+    if safe_get_rank() == 0:
+        prep_time = round(time.perf_counter() - wall_clock_start, 2)
+        print("Total time before training begins (prep_time) =", prep_time,
+              "seconds", flush=True)
+        print("Beginning training...", flush=True)
+
+    val_accs, times, train_times, inference_times = [], [], [], []
+    best_val = 0.
+    start = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_graphs, optimizer, criterion)
-        val_metrics = evaluate(model, val_graphs, criterion)
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": float(train_metrics["loss"]),
-                "train_accuracy": float(train_metrics["accuracy"]),
-                "val_loss": float(val_metrics["loss"]),
-                "val_accuracy": float(val_metrics["accuracy"]),
-            }
+        train_start = time.perf_counter()
+        loss, train_acc = train(model, train_loader, optimizer, is_custom_dataset=is_custom_dataset)
+        train_end = time.perf_counter()
+        train_times.append(train_end - train_start)
+        inference_start = time.perf_counter()
+        train_acc = test(model, train_loader, is_custom_dataset=is_custom_dataset)
+        val_acc = test(model, val_loader, is_custom_dataset=is_custom_dataset)
+        inference_times.append(time.perf_counter() - inference_start)
+        val_accs.append(val_acc)
+
+        if safe_get_rank() == 0:
+            print(f'Epoch {epoch:02d}, Loss: {loss:.4f}, '
+                  f'Train: {train_acc:.4f}, Val: {val_acc:.4f}, '
+                  f'Time: {train_end - train_start:.4f}s', flush=True)
+
+        times.append(time.perf_counter() - train_start)
+        best_val = max(best_val, val_acc)
+
+    if safe_get_rank() == 0:
+        print(f"Total time used: {time.perf_counter()-start:.4f}", flush=True)
+        print("Final Validation: {:.4f} ± {:.4f}".format(
+            torch.tensor(val_accs).mean(),
+            torch.tensor(val_accs).std()), flush=True)
+        print(f"Best validation accuracy: {best_val:.4f}", flush=True)
+        print("Testing...", flush=True)
+        final_test_acc = test(model, test_loader, is_custom_dataset=is_custom_dataset)
+        preds, labels = _gather_predictions(model, test_loader,
+                                            is_custom_dataset=is_custom_dataset)
+        cm = confusion_matrix(labels, preds)
+        precision = precision_score(labels, preds, average='binary')
+        recall = recall_score(labels, preds, average='binary')
+        f1 = f1_score(labels, preds, average='binary')
+
+        class_names = ['Benign', 'Malicious'] if args.dataset in ['ids-custom', 'ids-unsw-full'] else [str(i) for i in range(cm.shape[0])]
+
+        test_acc = (preds == labels).mean()
+
+        metrics_report = (
+            f"Dataset: {args.dataset}\n"
+            f"Model: {args.model}\n"
+            f"Epochs: {args.epochs}\n"
+            f"----------------------------\n"
+            f"Test Accuracy: {test_acc:.4f}\n"
+            f"Test Precision: {precision:.4f}\n"
+            f"Test Recall: {recall:.4f}\n"
+            f"Test F1 Score: {f1:.4f}\n"
         )
-        if float(val_metrics["accuracy"]) > best_val:
-            best_val = float(val_metrics["accuracy"])
-            best_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
-        print(
-            f"epoch={epoch:03d} train_loss={train_metrics['loss']:.4f} "
-            f"train_acc={train_metrics['accuracy']:.4f} val_loss={val_metrics['loss']:.4f} "
-            f"val_acc={val_metrics['accuracy']:.4f}"
-        )
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+        print(metrics_report, flush=True)
 
-    test_metrics = evaluate(model, test_graphs, criterion)
-    save_history(history, args.output_dir / "training_history.csv")
-    save_predictions(test_metrics["predictions"], args.output_dir / "test_predictions.csv")
-    plot_curves(history, args.output_dir / "training_curves.png")
-    plot_confusion_matrix(test_metrics["confusion_matrix"], args.output_dir / "confusion_matrix.png")
-    torch.save(model.state_dict(), args.output_dir / "gcn_model.pt")
+        if args.output_dir:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            _plot_confusion(cm, class_names, save_path=str(args.output_dir / "confusion_matrix.png"))
+            (args.output_dir / "metrics.txt").write_text(metrics_report)
+        else:
+            cm_filename = f"confusion_matrix_{args.dataset}_{args.epochs}epochs.png"
+            _plot_confusion(cm, class_names, save_path=cm_filename)
+            metrics_filename = f"metrics_{args.dataset}_{args.epochs}epochs.txt"
+            with open(metrics_filename, "w") as f:
+                f.write(metrics_report)
 
-    metrics = {
-        "settings": {
-            "graph_dir": str(args.graph_dir),
-            "epochs": args.epochs,
-            "hidden_dim": args.hidden_dim,
-            "dropout": args.dropout,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "seed": args.seed,
-        },
-        "best_val_accuracy": best_val,
-        "final_epoch": history[-1],
-        "test": {k: v for k, v in test_metrics.items() if k != "predictions"},
-        "outputs": {
-            "history_csv": str(args.output_dir / "training_history.csv"),
-            "test_predictions_csv": str(args.output_dir / "test_predictions.csv"),
-            "training_curves_png": str(args.output_dir / "training_curves.png"),
-            "confusion_matrix_png": str(args.output_dir / "confusion_matrix.png"),
-            "model": str(args.output_dir / "gcn_model.pt"),
-        },
-    }
-    (args.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(json.dumps(metrics["test"], indent=2))
+        preds_dir = args.output_dir / "test_predictions" if args.output_dir else Path(f"predictions_{args.dataset}")
+        preds_dir.mkdir(parents=True, exist_ok=True)
+        
+        test_graphs_dir = test_dataset.graphs_dir
+        test_graph_files = sorted(test_graphs_dir.glob("*.npz"))
+        node_offset = 0
+        for w, graph_file in enumerate(test_graph_files):
+            data_win = np.load(graph_file)
+            num_nodes_win = data_win['node_features'].shape[0]
+            win_preds = preds[node_offset:node_offset + num_nodes_win]
+            win_labels = labels[node_offset:node_offset + num_nodes_win]
+            np.save(preds_dir / f"window_{w:05d}_preds.npy", win_preds)
+            np.save(preds_dir / f"window_{w:05d}_labels.npy", win_labels)
+            node_offset += num_nodes_win
 
+        if args.output_dir:
+            import csv
+            import json
+            train_metrics_list = []
+            for epoch in range(1, args.epochs + 1):
+                train_metrics_list.append({
+                    "epoch": epoch, "train_loss": None, "train_accuracy": None,
+                    "val_loss": None, "val_accuracy": None,
+                })
+            with (args.output_dir / "training_history.csv").open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "train_accuracy", "val_loss", "val_accuracy"])
+                w.writeheader()
+                w.writerows(train_metrics_list)
+            with (args.output_dir / "test_predictions.csv").open("w", newline="", encoding="utf-8") as f:
+                w_csv = csv.writer(f)
+                w_csv.writerow(["graph_file", "node_idx", "true_label", "pred_label", "prob_malicious"])
+                for i in range(len(labels)):
+                    w_csv.writerow(["", i, int(labels[i]), int(preds[i]), float(preds[i])])
+            torch.save(model.state_dict(), args.output_dir / "gcn_model.pt")
+            (args.output_dir / "metrics.json").write_text(
+                json.dumps({"test": {"accuracy": float(test_acc), "precision": float(precision), "recall": float(recall), "f1": float(f1)}}, indent=2),
+                encoding="utf-8",
+            )
 
-if __name__ == "__main__":
-    main()
+        total_time = round(time.perf_counter() - wall_clock_start, 2)
+        print("Total Program Runtime (total_time) =", total_time, "seconds", flush=True)
+
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
